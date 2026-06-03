@@ -23,7 +23,9 @@ class EpubReaderMenuActivity final : public Activity {
     SYNC,
     DELETE_CACHE,
     RESET_READING_TIMER,
-    READER_OPTIONS
+    READER_OPTIONS,
+    HIGHLIGHT,   // enter highlight-selection mode
+    HIGHLIGHTS,  // open the highlights list (view / jump / delete)
   };
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
