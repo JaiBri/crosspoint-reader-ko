@@ -1,22 +1,24 @@
-#include "HighlightListActivity.h"
+#include "SidecarListActivity.h"
 
 #include <GfxRenderer.h>
 #include <I18n.h>
 
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <utility>
+#include <variant>
 
 #include "MappedInputManager.h"
+#include "SidecarDetailActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
 namespace {
-constexpr unsigned long DELETE_HOLD_MS = 800;
 constexpr int LINE_HEIGHT = 30;
 }  // namespace
 
-int HighlightListActivity::getPageItems() const {
+int SidecarListActivity::getPageItems() const {
   const int screenHeight = renderer.getScreenHeight();
   const auto orientation = renderer.getOrientation();
   const bool isPortraitInverted = orientation == GfxRenderer::Orientation::PortraitInverted;
@@ -26,20 +28,47 @@ int HighlightListActivity::getPageItems() const {
   return std::max(1, availableHeight / LINE_HEIGHT);
 }
 
-void HighlightListActivity::onEnter() {
+void SidecarListActivity::onEnter() {
   Activity::onEnter();
-  if (selectorIndex >= static_cast<int>(highlights.size())) {
-    selectorIndex = std::max(0, static_cast<int>(highlights.size()) - 1);
+  if (selectorIndex >= static_cast<int>(rows.size())) {
+    selectorIndex = std::max(0, static_cast<int>(rows.size()) - 1);
   }
   requestUpdate();
 }
 
-void HighlightListActivity::onExit() { Activity::onExit(); }
+void SidecarListActivity::onExit() { Activity::onExit(); }
 
-void HighlightListActivity::loop() {
-  const int total = static_cast<int>(highlights.size());
+void SidecarListActivity::openDetail() {
+  if (selectorIndex < 0 || selectorIndex >= static_cast<int>(rows.size())) return;
+  const int idx = selectorIndex;
+  const Row& r = rows[idx];
+  startActivityForResult(
+      std::make_unique<SidecarDetailActivity>(
+          renderer, mappedInput, title, r.body, r.note, r.spine, r.page,
+          [this, idx](const std::string& n) {
+            if (idx < static_cast<int>(rows.size())) rows[idx].note = n;
+            if (onEdit) onEdit(idx, n);
+          },
+          [this, idx]() {
+            if (onDelete) onDelete(idx);
+            if (idx < static_cast<int>(rows.size())) rows.erase(rows.begin() + idx);
+          }),
+      [this](const ActivityResult& res) {
+        if (!res.isCancelled && std::holds_alternative<SyncResult>(res.data)) {
+          const auto sync = std::get<SyncResult>(res.data);
+          setResult(SyncResult{sync.spineIndex, sync.page});  // bubble the jump up to the reader
+          finish();
+          return;
+        }
+        if (selectorIndex >= static_cast<int>(rows.size())) {
+          selectorIndex = std::max(0, static_cast<int>(rows.size()) - 1);
+        }
+        requestUpdate();
+      });
+}
 
-  // Cancel.
+void SidecarListActivity::loop() {
+  // Back -> cancel.
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     ActivityResult result;
     result.isCancelled = true;
@@ -48,36 +77,14 @@ void HighlightListActivity::loop() {
     return;
   }
 
+  const int total = static_cast<int>(rows.size());
   if (total == 0) {
-    return;  // nothing to select or navigate
+    return;  // nothing to open or navigate
   }
 
-  // Long-press Confirm deletes the selected highlight (and persists the change).
-  if (mappedInput.isPressed(MappedInputManager::Button::Confirm) && mappedInput.getHeldTime() >= DELETE_HOLD_MS &&
-      !deleteArmed) {
-    deleteArmed = true;
-    if (selectorIndex >= 0 && selectorIndex < static_cast<int>(highlights.size())) {
-      highlights.erase(highlights.begin() + selectorIndex);
-      if (onChanged) onChanged();
-      if (selectorIndex >= static_cast<int>(highlights.size())) {
-        selectorIndex = std::max(0, static_cast<int>(highlights.size()) - 1);
-      }
-    }
-    requestUpdate();
-    return;
-  }
-
-  // Short Confirm jumps to the selected highlight's start page.
+  // Confirm opens the detail window for the selected entry.
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    if (deleteArmed) {
-      deleteArmed = false;  // release that ended a long-press delete — swallow it
-      return;
-    }
-    if (selectorIndex >= 0 && selectorIndex < static_cast<int>(highlights.size())) {
-      const auto& h = highlights[selectorIndex];
-      setResult(SyncResult{static_cast<int>(h.spine), static_cast<int>(h.start.page)});
-      finish();
-    }
+    openDetail();
     return;
   }
 
@@ -100,7 +107,7 @@ void HighlightListActivity::loop() {
   });
 }
 
-void HighlightListActivity::render(RenderLock&&) {
+void SidecarListActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
   const auto pageWidth = renderer.getScreenWidth();
@@ -115,12 +122,12 @@ void HighlightListActivity::render(RenderLock&&) {
   const int contentY = hintGutterHeight;
 
   const int titleX =
-      contentX + (contentWidth - renderer.getTextWidth(UI_12_FONT_ID, tr(STR_HIGHLIGHTS), EpdFontFamily::BOLD)) / 2;
-  renderer.drawText(UI_12_FONT_ID, titleX, 15 + contentY, tr(STR_HIGHLIGHTS), true, EpdFontFamily::BOLD);
+      contentX + (contentWidth - renderer.getTextWidth(UI_12_FONT_ID, title.c_str(), EpdFontFamily::BOLD)) / 2;
+  renderer.drawText(UI_12_FONT_ID, titleX, 15 + contentY, title.c_str(), true, EpdFontFamily::BOLD);
 
-  const int total = static_cast<int>(highlights.size());
+  const int total = static_cast<int>(rows.size());
   if (total == 0) {
-    renderer.drawCenteredText(UI_10_FONT_ID, 120 + contentY, tr(STR_NO_HIGHLIGHTS));
+    renderer.drawCenteredText(UI_10_FONT_ID, 120 + contentY, emptyMessage.c_str());
     const auto labels0 = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels0.btn1, labels0.btn2, labels0.btn3, labels0.btn4);
     renderer.displayBuffer();
@@ -137,13 +144,7 @@ void HighlightListActivity::render(RenderLock&&) {
     if (itemIndex >= total) break;
     const int displayY = 60 + contentY + i * LINE_HEIGHT;
     const bool isSelected = (itemIndex == selectorIndex);
-    const auto& h = highlights[itemIndex];
-
-    const std::string marker = h.note.empty() ? "" : "* ";  // '*' flags an attached comment
-    const std::string label = marker + "Ch " + std::to_string(h.spine + 1) + " p" +
-                              std::to_string(h.start.page + 1) + ": " +
-                              (h.text.empty() ? std::string("(empty)") : h.text);
-    const std::string shown = renderer.truncatedText(UI_10_FONT_ID, label.c_str(), contentWidth - 40);
+    const std::string shown = renderer.truncatedText(UI_10_FONT_ID, rows[itemIndex].label.c_str(), contentWidth - 40);
     renderer.drawText(UI_10_FONT_ID, contentX + 20, displayY, shown.c_str(), !isSelected);
   }
 

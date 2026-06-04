@@ -73,20 +73,38 @@ struct Highlight {
   std::string note;  // optional user comment, shown under the quote in the sidecar
 };
 
+// A bookmark marks a whole page (not a character range), stored in the SAME
+// sidecar file as highlights under a distinct `<!-- cpx-bm v1 ... -->` marker.
+struct Bookmark {
+  uint16_t spine = 0;  // chapter (spine item) index
+  uint16_t page = 0;   // page index within that chapter's section
+  LayoutParams layout;
+  std::string text;  // short label: a snippet of the bookmarked page (human-readable)
+  std::string note;  // optional user comment
+};
+
 // Sidecar path for a book: "<bookPath>.highlights.md" — sits next to the book
 // so it travels with it when the SD card is moved.
 std::string sidecarPath(const std::string& bookPath);
 
 // Reading-order ordering used to sort the file "by page": (spine, start...).
 bool highlightLess(const Highlight& a, const Highlight& b);
+// Bookmark ordering: by (spine, page).
+bool bookmarkLess(const Bookmark& a, const Bookmark& b);
 
-// Render the in-memory highlights to the Markdown sidecar text. Sorts a copy by
-// reading order; `bookTitle` populates the H1. Pure: returns the file contents.
-std::string serialize(const std::string& bookTitle, const std::vector<Highlight>& items);
+// Render the in-memory highlights (and optional bookmarks) to the Markdown
+// sidecar text. Sorts copies by reading order; `bookTitle` populates the H1.
+// Pure: returns the file contents. Both item types share one file, so callers
+// must pass BOTH current vectors or the omitted type would be erased on write.
+std::string serialize(const std::string& bookTitle, const std::vector<Highlight>& items,
+                      const std::vector<Bookmark>& bookmarks = {});
 
 // Parse a Markdown sidecar back into highlights. Tolerant of user-added prose:
-// only `<!-- cpx ... -->` metadata lines (and the `>` quote block immediately
-// above each) are interpreted. Unknown/old schema lines are skipped.
+// only `<!-- cpx v1 ... -->` metadata lines (and the `>` quote block immediately
+// above each) are interpreted. Bookmark (`cpx-bm`) and unknown lines are skipped.
 std::vector<Highlight> parse(const std::string& markdown);
+
+// Parse the bookmarks (`<!-- cpx-bm v1 ... -->`) from the same sidecar text.
+std::vector<Bookmark> parseBookmarks(const std::string& markdown);
 
 }  // namespace highlight

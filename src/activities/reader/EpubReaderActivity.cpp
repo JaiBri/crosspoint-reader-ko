@@ -21,7 +21,7 @@
 #include "QrDisplayActivity.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
-#include "HighlightListActivity.h"
+#include "SidecarListActivity.h"
 #include "activities/settings/ReaderOptionsActivity.h"
 #include "activities/util/ConfirmationActivity.h"
 #include "activities/util/KeyboardEntryActivity.h"
@@ -102,7 +102,7 @@ void EpubReaderActivity::onEnter() {
   readingTimer.start(epub->getCachePath());
 
   // Load existing highlights for this book (sidecar Markdown next to the file).
-  loadHighlightsIfNeeded();
+  loadSidecarIfNeeded();
 
   // Trigger first update
   requestUpdate();
@@ -521,6 +521,14 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       openHighlightsList();
       break;
     }
+    case EpubReaderMenuActivity::MenuAction::BOOKMARK: {
+      addBookmarkForCurrentPage();
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::VIEW_BOOKMARKS: {
+      openBookmarksList();
+      break;
+    }
     case EpubReaderMenuActivity::MenuAction::READER_OPTIONS:
       // Reader Options is launched as a sub-activity of the menu itself,
       // never dispatched here. Layout/orientation changes are reconciled
@@ -889,6 +897,12 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       syncHighlightCursorToPage();
     }
     drawHighlightOverlay();
+    if (highlightMode) {
+      // Show what the buttons do while selecting: Cancel / Start|End / move-word.
+      const auto labels = mappedInput.mapLabels(tr(STR_BACK), hlSelecting ? tr(STR_HIGHLIGHT_END) : tr(STR_HIGHLIGHT_START),
+                                                tr(STR_PREV_WORD), tr(STR_NEXT_WORD));
+      GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    }
   }
 
   fcm->logStats("bw_render");
@@ -1125,32 +1139,40 @@ std::string utf8SubstrCp(const std::string& s, int from, int to) {
 
 }  // namespace
 
-void EpubReaderActivity::loadHighlightsIfNeeded() {
-  if (highlightsLoaded || !epub) {
+void EpubReaderActivity::loadSidecarIfNeeded() {
+  if (sidecarLoaded || !epub) {
     return;
   }
-  highlightsLoaded = true;
+  sidecarLoaded = true;
   const std::string path = highlight::sidecarPath(epub->getPath());
   if (!Storage.exists(path.c_str())) {
     return;
   }
   const String content = Storage.readFile(path.c_str());
   if (content.length() > 0) {
-    highlights = highlight::parse(std::string(content.c_str()));
+    // Highlights and bookmarks share one .md file; parse each from it.
+    const std::string md(content.c_str());
+    highlights = highlight::parse(md);
+    bookmarks = highlight::parseBookmarks(md);
     std::sort(highlights.begin(), highlights.end(), highlight::highlightLess);
-    LOG_DBG("ERS", "Loaded %u highlights", static_cast<uint32_t>(highlights.size()));
+    std::sort(bookmarks.begin(), bookmarks.end(), highlight::bookmarkLess);
+    LOG_DBG("ERS", "Loaded %u highlights, %u bookmarks", static_cast<uint32_t>(highlights.size()),
+            static_cast<uint32_t>(bookmarks.size()));
   }
 }
 
-void EpubReaderActivity::saveHighlights() {
+void EpubReaderActivity::saveSidecar() {
   if (!epub) {
     return;
   }
+  // Both types live in one file, so always serialize BOTH — writing only one
+  // would erase the other.
   std::sort(highlights.begin(), highlights.end(), highlight::highlightLess);
-  const std::string md = highlight::serialize(epub->getTitle(), highlights);
+  std::sort(bookmarks.begin(), bookmarks.end(), highlight::bookmarkLess);
+  const std::string md = highlight::serialize(epub->getTitle(), highlights, bookmarks);
   const std::string path = highlight::sidecarPath(epub->getPath());
   if (!Storage.writeFile(path.c_str(), String(md.c_str()))) {
-    LOG_ERR("ERS", "Failed to write highlights sidecar: %s", path.c_str());
+    LOG_ERR("ERS", "Failed to write sidecar: %s", path.c_str());
   }
 }
 
@@ -1178,6 +1200,13 @@ void EpubReaderActivity::handleHighlightInput() {
     exitHighlightMode();
     return;
   }
+  // After a page turn the cursor and page geometry are resynced by the render
+  // task (syncHighlightCursorToPage clears hlPending). Until that happens — or
+  // while a render is in flight — ignore movement/commit so we never act on
+  // geometry that doesn't match the cursor's page. Back (above) still cancels.
+  if (hlPending != HlPending::None || RenderLock::peek()) {
+    return;
+  }
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     if (!hlSelecting) {
       // First press drops the start anchor.
@@ -1196,56 +1225,91 @@ void EpubReaderActivity::handleHighlightInput() {
     return;
   }
 
-  // Side buttons move the cursor by line; front Left/Right move it by character.
-  // At a page edge, Down/Right advance and Left retreats to the adjacent page
-  // (within the current chapter), so a selection can flow across pages.
-  if (mappedInput.wasReleased(MappedInputManager::Button::Up)) {
-    if (hlCursor.line > 0) {
-      hlCursor.line--;
-      const int cc = pageGeom[hlCursor.line].charCount;
-      if (hlCursor.ch > cc) hlCursor.ch = static_cast<uint16_t>(cc);
-      requestUpdate();
+  // Word-granular selection. Forward = Down or Right, backward = Up or Left.
+  // Forward always advances a whole word (turning the page at the end so the
+  // selection flows across pages). Backward is only allowed before locking the
+  // start: once selecting, the start word's location is fixed and you cannot go
+  // back — Up/Left are ignored.
+  if (mappedInput.wasReleased(MappedInputManager::Button::Down) ||
+      mappedInput.wasReleased(MappedInputManager::Button::Right)) {
+    hlMoveForwardWord();
+    return;
+  }
+  if (mappedInput.wasReleased(MappedInputManager::Button::Up) ||
+      mappedInput.wasReleased(MappedInputManager::Button::Left)) {
+    if (!hlSelecting) {
+      hlMoveBackwardWord();
     }
     return;
   }
-  if (mappedInput.wasReleased(MappedInputManager::Button::Down)) {
-    if (hlCursor.line + 1 < static_cast<int>(pageGeom.size())) {
-      hlCursor.line++;
-      const int cc = pageGeom[hlCursor.line].charCount;
-      if (hlCursor.ch > cc) hlCursor.ch = static_cast<uint16_t>(cc);
-      requestUpdate();
-    } else {
-      highlightPageTurn(true);  // bottom of page -> next page
-    }
+}
+
+int EpubReaderActivity::hlWordIndex(const HlLine& line, int ch) const {
+  if (line.words.empty()) return -1;
+  for (size_t i = 0; i < line.words.size(); i++) {
+    const auto& w = line.words[i];
+    if (ch >= w.logicalStart && ch < w.logicalStart + w.chars) return static_cast<int>(i);
+  }
+  // ch landed on a space/end boundary: snap to the last word that starts at or before ch.
+  int best = 0;
+  for (size_t i = 0; i < line.words.size(); i++) {
+    if (line.words[i].logicalStart <= ch) best = static_cast<int>(i);
+  }
+  return best;
+}
+
+int EpubReaderActivity::hlCursorWordEnd() const {
+  if (hlCursor.line >= pageGeom.size()) return hlCursor.ch;
+  const HlLine& line = pageGeom[hlCursor.line];
+  const int wi = hlWordIndex(line, hlCursor.ch);
+  if (wi < 0) return hlCursor.ch;
+  return line.words[wi].logicalStart + line.words[wi].chars;
+}
+
+void EpubReaderActivity::hlMoveForwardWord() {
+  if (pageGeom.empty()) {
+    highlightPageTurn(true);
     return;
   }
-  if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
-    const HlLine& line = pageGeom[hlCursor.line];
-    if (hlCursor.ch < line.charCount) {
-      hlCursor.ch++;
-      requestUpdate();
-    } else if (hlCursor.line + 1 < static_cast<int>(pageGeom.size())) {
-      hlCursor.line++;
-      hlCursor.ch = 0;
-      requestUpdate();
-    } else {
-      highlightPageTurn(true);  // end of last line -> next page
-    }
+  const HlLine& line = pageGeom[hlCursor.line];
+  const int wi = hlWordIndex(line, hlCursor.ch);
+  if (wi >= 0 && wi + 1 < static_cast<int>(line.words.size())) {
+    hlCursor.ch = static_cast<uint16_t>(line.words[wi + 1].logicalStart);
+    requestUpdate();
     return;
   }
-  if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
-    if (hlCursor.ch > 0) {
-      hlCursor.ch--;
+  for (int li = hlCursor.line + 1; li < static_cast<int>(pageGeom.size()); li++) {
+    if (!pageGeom[li].words.empty()) {
+      hlCursor.line = static_cast<uint16_t>(li);
+      hlCursor.ch = static_cast<uint16_t>(pageGeom[li].words.front().logicalStart);
       requestUpdate();
-    } else if (hlCursor.line > 0) {
-      hlCursor.line--;
-      hlCursor.ch = static_cast<uint16_t>(pageGeom[hlCursor.line].charCount);
-      requestUpdate();
-    } else {
-      highlightPageTurn(false);  // start of first line -> previous page
+      return;
     }
+  }
+  highlightPageTurn(true);  // past the last word on the page -> next page
+}
+
+void EpubReaderActivity::hlMoveBackwardWord() {
+  if (pageGeom.empty()) {
+    highlightPageTurn(false);
     return;
   }
+  const HlLine& line = pageGeom[hlCursor.line];
+  const int wi = hlWordIndex(line, hlCursor.ch);
+  if (wi > 0) {
+    hlCursor.ch = static_cast<uint16_t>(line.words[wi - 1].logicalStart);
+    requestUpdate();
+    return;
+  }
+  for (int li = static_cast<int>(hlCursor.line) - 1; li >= 0; li--) {
+    if (!pageGeom[li].words.empty()) {
+      hlCursor.line = static_cast<uint16_t>(li);
+      hlCursor.ch = static_cast<uint16_t>(pageGeom[li].words.back().logicalStart);
+      requestUpdate();
+      return;
+    }
+  }
+  highlightPageTurn(false);  // before the first word on the page -> previous page
 }
 
 void EpubReaderActivity::highlightPageTurn(bool forward) {
@@ -1272,8 +1336,10 @@ void EpubReaderActivity::highlightPageTurn(bool forward) {
 }
 
 void EpubReaderActivity::commitHighlight() {
+  // The anchor sits at its word's start; extend the end boundary to the end of
+  // the word under the cursor so a whole-word range is captured.
   highlight::Pos a = hlAnchor;
-  highlight::Pos b = hlCursor;
+  highlight::Pos b{hlCursor.page, hlCursor.line, static_cast<uint16_t>(hlCursorWordEnd())};
   if (highlight::posLess(b, a)) std::swap(a, b);
   if (highlight::posEqual(a, b)) {
     exitHighlightMode();  // empty selection — nothing to store
@@ -1317,7 +1383,7 @@ void EpubReaderActivity::promptForHighlightComment() {
 void EpubReaderActivity::storePendingHighlight() {
   highlights.push_back(std::move(pendingHighlight));
   pendingHighlight = highlight::Highlight{};
-  saveHighlights();
+  saveSidecar();
   LOG_DBG("ERS", "Stored highlight (%u highlights total)", static_cast<uint32_t>(highlights.size()));
   requestUpdate();
 }
@@ -1414,7 +1480,8 @@ void EpubReaderActivity::syncHighlightCursorToPage() {
       hlCursor.ch = 0;
     } else {
       hlCursor.line = static_cast<uint16_t>(pageGeom.size() - 1);
-      hlCursor.ch = static_cast<uint16_t>(pageGeom.back().charCount);
+      const auto& lw = pageGeom.back().words;
+      hlCursor.ch = static_cast<uint16_t>(lw.empty() ? 0 : lw.back().logicalStart);
     }
     hlPending = HlPending::None;
   }
@@ -1468,7 +1535,6 @@ void EpubReaderActivity::drawHighlightSpan(const HlLine& line, int chFrom, int c
 }
 
 void EpubReaderActivity::drawHighlightOverlay() {
-  const int fontId = SETTINGS.getReaderFontId();
   const int p = section ? section->currentPage : 0;
   const highlight::LayoutParams layout = currentLayout();
 
@@ -1491,11 +1557,11 @@ void EpubReaderActivity::drawHighlightOverlay() {
     return;
   }
 
-  // Live, in-progress selection between the anchor and the moving cursor,
-  // clipped to the portion on the current page.
   if (hlSelecting) {
+    // Live, in-progress selection from the (fixed) start word to the word under
+    // the moving cursor, clipped to the portion on the current page.
     highlight::Pos a = hlAnchor;
-    highlight::Pos b = hlCursor;
+    highlight::Pos b{hlCursor.page, hlCursor.line, static_cast<uint16_t>(hlCursorWordEnd())};
     if (highlight::posLess(b, a)) std::swap(a, b);
     if (!(p < a.page || p > b.page)) {
       const int lineFrom = (p == a.page) ? a.line : 0;
@@ -1507,14 +1573,16 @@ void EpubReaderActivity::drawHighlightOverlay() {
         drawHighlightSpan(pageGeom[li], cf, ct);
       }
     }
-  }
-
-  // Caret at the moving cursor (a thin vertical bar).
-  if (hlCursor.page == p && hlCursor.line < pageGeom.size()) {
-    const HlLine& line = pageGeom[hlCursor.line];
-    const int x = boundaryXAt(line, hlCursor.ch);
-    const int asc = renderer.getFontAscenderSize(fontId);
-    renderer.drawLine(x, line.yTop, x, line.yTop + asc, 2, true);
+  } else {
+    // Not yet selecting: preview the whole word under the cursor (this also
+    // shows where the cursor is, so no separate caret is needed).
+    if (hlCursor.page == p && hlCursor.line < pageGeom.size()) {
+      const HlLine& line = pageGeom[hlCursor.line];
+      const int wi = hlWordIndex(line, hlCursor.ch);
+      if (wi >= 0) {
+        drawHighlightSpan(line, line.words[wi].logicalStart, line.words[wi].logicalStart + line.words[wi].chars);
+      }
+    }
   }
 }
 
@@ -1578,11 +1646,40 @@ std::string EpubReaderActivity::extractText(const highlight::Pos& a, const highl
   return result;
 }
 
+// Shared handler for a SidecarListActivity result: a SyncResult means "jump
+// here"; anything else (Back / after an in-detail edit or delete) just refreshes.
 void EpubReaderActivity::openHighlightsList() {
+  std::sort(highlights.begin(), highlights.end(), highlight::highlightLess);
+  std::vector<SidecarListActivity::Row> rows;
+  rows.reserve(highlights.size());
+  for (const auto& h : highlights) {
+    SidecarListActivity::Row r;
+    const std::string marker = h.note.empty() ? "" : "* ";  // '*' flags an attached comment
+    r.label = marker + "Ch " + std::to_string(h.spine + 1) + " p" + std::to_string(h.start.page + 1) + ": " +
+              (h.text.empty() ? std::string("(empty)") : h.text);
+    r.body = h.text;
+    r.note = h.note;
+    r.spine = static_cast<int>(h.spine);
+    r.page = static_cast<int>(h.start.page);
+    rows.push_back(std::move(r));
+  }
   startActivityForResult(
-      std::make_unique<HighlightListActivity>(renderer, mappedInput, highlights, [this]() { saveHighlights(); }),
+      std::make_unique<SidecarListActivity>(
+          renderer, mappedInput, std::move(rows), std::string(tr(STR_HIGHLIGHTS)), std::string(tr(STR_NO_HIGHLIGHTS)),
+          [this](int idx, const std::string& note) {
+            if (idx >= 0 && idx < static_cast<int>(highlights.size())) {
+              highlights[idx].note = note;
+              saveSidecar();
+            }
+          },
+          [this](int idx) {
+            if (idx >= 0 && idx < static_cast<int>(highlights.size())) {
+              highlights.erase(highlights.begin() + idx);
+              saveSidecar();
+            }
+          }),
       [this](const ActivityResult& result) {
-        if (!result.isCancelled) {
+        if (!result.isCancelled && std::holds_alternative<SyncResult>(result.data)) {
           const auto& jump = std::get<SyncResult>(result.data);
           if (currentSpineIndex != jump.spineIndex || (section && section->currentPage != jump.page)) {
             RenderLock lock(*this);
@@ -1593,4 +1690,95 @@ void EpubReaderActivity::openHighlightsList() {
         }
         requestUpdate();
       });
+}
+
+void EpubReaderActivity::openBookmarksList() {
+  std::sort(bookmarks.begin(), bookmarks.end(), highlight::bookmarkLess);
+  std::vector<SidecarListActivity::Row> rows;
+  rows.reserve(bookmarks.size());
+  for (const auto& b : bookmarks) {
+    SidecarListActivity::Row r;
+    const std::string marker = b.note.empty() ? "" : "* ";
+    r.label = marker + "Ch " + std::to_string(b.spine + 1) + " p" + std::to_string(b.page + 1) +
+              (b.text.empty() ? std::string("") : ": " + b.text);
+    r.body = b.text;
+    r.note = b.note;
+    r.spine = static_cast<int>(b.spine);
+    r.page = static_cast<int>(b.page);
+    rows.push_back(std::move(r));
+  }
+  startActivityForResult(
+      std::make_unique<SidecarListActivity>(
+          renderer, mappedInput, std::move(rows), std::string(tr(STR_VIEW_BOOKMARKS)),
+          std::string(tr(STR_NO_BOOKMARKS)),
+          [this](int idx, const std::string& note) {
+            if (idx >= 0 && idx < static_cast<int>(bookmarks.size())) {
+              bookmarks[idx].note = note;
+              saveSidecar();
+            }
+          },
+          [this](int idx) {
+            if (idx >= 0 && idx < static_cast<int>(bookmarks.size())) {
+              bookmarks.erase(bookmarks.begin() + idx);
+              saveSidecar();
+            }
+          }),
+      [this](const ActivityResult& result) {
+        if (!result.isCancelled && std::holds_alternative<SyncResult>(result.data)) {
+          const auto& jump = std::get<SyncResult>(result.data);
+          if (currentSpineIndex != jump.spineIndex || (section && section->currentPage != jump.page)) {
+            RenderLock lock(*this);
+            currentSpineIndex = jump.spineIndex;
+            nextPageNumber = jump.page;
+            section.reset();
+          }
+        }
+        requestUpdate();
+      });
+}
+
+void EpubReaderActivity::addBookmarkForCurrentPage() {
+  if (!section) {
+    return;
+  }
+  pendingBookmark = highlight::Bookmark{};
+  pendingBookmark.spine = static_cast<uint16_t>(currentSpineIndex);
+  pendingBookmark.page = static_cast<uint16_t>(section->currentPage);
+  pendingBookmark.layout = currentLayout();
+  // Human-readable label = the first non-empty line of the current page.
+  const auto texts = pageLineTexts(section->currentPage);
+  for (const auto& t : texts) {
+    if (!t.empty()) {
+      pendingBookmark.text = t;
+      break;
+    }
+  }
+  promptForBookmarkComment();  // ask whether to attach a comment, then store
+}
+
+void EpubReaderActivity::promptForBookmarkComment() {
+  startActivityForResult(
+      std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_ADD_COMMENT_PROMPT), ""),
+      [this](const ActivityResult& confirmResult) {
+        if (!confirmResult.isCancelled) {
+          startActivityForResult(
+              std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_ADD_COMMENT), "", 0, false),
+              [this](const ActivityResult& kbResult) {
+                if (!kbResult.isCancelled) {
+                  pendingBookmark.note = std::get<KeyboardResult>(kbResult.data).text;
+                }
+                storePendingBookmark();
+              });
+        } else {
+          storePendingBookmark();  // no comment
+        }
+      });
+}
+
+void EpubReaderActivity::storePendingBookmark() {
+  bookmarks.push_back(std::move(pendingBookmark));
+  pendingBookmark = highlight::Bookmark{};
+  saveSidecar();
+  LOG_DBG("ERS", "Stored bookmark (%u bookmarks total)", static_cast<uint32_t>(bookmarks.size()));
+  requestUpdate();
 }

@@ -11,6 +11,7 @@
 
 #include "util/HighlightStore.h"
 
+using highlight::Bookmark;
 using highlight::Highlight;
 using highlight::LayoutParams;
 using highlight::Pos;
@@ -192,6 +193,90 @@ static void testMultiLineQuoteJoin() {
   }
 }
 
+static void testNegativeFontId() {
+  // Regression: getReaderFontId() is a hash that can be negative. The layout
+  // fingerprint's signed ints (fontId, lineCompressionX100) must round-trip;
+  // otherwise the entry is silently dropped on load and the highlight vanishes.
+  std::vector<Highlight> items;
+  Highlight h = makeHl(9, Pos{0, 0, 0}, Pos{0, 5, 3}, "On Giving Up");
+  h.layout.fontId = -1446433084;       // real-world negative hashed font id
+  h.layout.lineCompressionX100 = -25;  // also signed
+  items.push_back(h);
+
+  const std::string md = highlight::serialize("On Giving Up", items);
+  const auto back = highlight::parse(md);
+  CHECK(back.size() == 1);
+  if (back.size() == 1) {
+    CHECK(back[0].layout.fontId == -1446433084);
+    CHECK(back[0].layout.lineCompressionX100 == -25);
+    CHECK(back[0].layout == h.layout);
+    CHECK(back[0].text == "On Giving Up");
+  }
+}
+
+static void testBookmarkRoundTrip() {
+  std::vector<Highlight> none;
+  std::vector<Bookmark> bms;
+  Bookmark b;
+  b.spine = 4;
+  b.page = 11;
+  b.layout = sampleLayout();
+  b.layout.fontId = -1446433084;  // hashed font id is signed — must round-trip
+  b.text = "On giving up the idea that";
+  b.note = "revisit this";
+  bms.push_back(b);
+
+  const std::string md = highlight::serialize("On Giving Up", none, bms);
+  CHECK(md.find("## Bookmark — Chapter 5, Page 12") != std::string::npos);
+  CHECK(md.find("<!-- cpx-bm v1 sp=4 p=11 ly=-1446433084,") != std::string::npos);
+
+  const auto back = highlight::parseBookmarks(md);
+  CHECK(back.size() == 1);
+  if (back.size() == 1) {
+    CHECK(back[0].spine == 4);
+    CHECK(back[0].page == 11);
+    CHECK(back[0].layout.fontId == -1446433084);
+    CHECK(back[0].layout == b.layout);
+    CHECK(back[0].text == "On giving up the idea that");
+    CHECK(back[0].note == "revisit this");
+  }
+  // A bookmark-only file has no highlights.
+  CHECK(highlight::parse(md).empty());
+}
+
+static void testMixedFileNoCrossContamination() {
+  // One highlight and one bookmark serialized into the SAME file must parse back
+  // cleanly: parse() sees only the highlight, parseBookmarks() only the bookmark.
+  std::vector<Highlight> hs;
+  hs.push_back(makeHl(2, Pos{1, 0, 5}, Pos{1, 2, 22}, "the spice must flow"));
+  hs.back().note = "Dune ref";
+  std::vector<Bookmark> bms;
+  Bookmark b;
+  b.spine = 7;
+  b.page = 3;
+  b.layout = sampleLayout();
+  b.text = "chapter opener";
+  bms.push_back(b);
+
+  const std::string md = highlight::serialize("Mixed", hs, bms);
+
+  const auto gotH = highlight::parse(md);
+  CHECK(gotH.size() == 1);
+  if (gotH.size() == 1) {
+    CHECK(gotH[0].spine == 2);
+    CHECK(gotH[0].text == "the spice must flow");
+    CHECK(gotH[0].note == "Dune ref");
+  }
+
+  const auto gotB = highlight::parseBookmarks(md);
+  CHECK(gotB.size() == 1);
+  if (gotB.size() == 1) {
+    CHECK(gotB[0].spine == 7);
+    CHECK(gotB[0].page == 3);
+    CHECK(gotB[0].text == "chapter opener");
+  }
+}
+
 int main() {
   testRoundTrip();
   testSortByPage();
@@ -200,6 +285,9 @@ int main() {
   testSidecarPath();
   testNoteRoundTrip();
   testMultiLineQuoteJoin();
+  testNegativeFontId();
+  testBookmarkRoundTrip();
+  testMixedFileNoCrossContamination();
 
   if (g_failures == 0) {
     std::printf("HighlightStore: ALL TESTS PASSED\n");

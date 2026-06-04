@@ -83,19 +83,26 @@ class EpubReaderActivity final : public Activity {
   highlight::Pos hlCursor;             // moving cursor
   highlight::Highlight pendingHighlight;  // built on commit, stored after the optional-comment chain
   std::vector<highlight::Highlight> highlights;  // loaded for this book
-  bool highlightsLoaded = false;
+  std::vector<highlight::Bookmark> bookmarks;    // loaded for this book (same sidecar file)
+  highlight::Bookmark pendingBookmark;           // built on create, stored after the optional-comment chain
+  bool sidecarLoaded = false;
   std::vector<HlLine> pageGeom;        // current page geometry (rebuilt each render)
   int hlMarginLeft = 0;
   int hlMarginTop = 0;
   uint16_t hlViewportW = 0;            // pagination viewport (for layout fingerprint)
   uint16_t hlViewportH = 0;
 
-  void loadHighlightsIfNeeded();
-  void saveHighlights();
+  void loadSidecarIfNeeded();  // loads BOTH highlights and bookmarks from the one .md file
+  void saveSidecar();          // writes BOTH back (highlights-only write would erase bookmarks)
   void enterHighlightMode();
   void exitHighlightMode();
   void handleHighlightInput();
   void highlightPageTurn(bool forward);  // within-chapter page step for the cursor
+  // Word-granular cursor navigation over the current page geometry (pageGeom).
+  int hlWordIndex(const HlLine& line, int ch) const;  // word containing/at ch, or -1 if line empty
+  int hlCursorWordEnd() const;                        // logical-char end of the word under the cursor
+  void hlMoveForwardWord();   // Down/Right: next word, turning the page at the end
+  void hlMoveBackwardWord();  // Up/Left: previous word, turning the page at the start
   void commitHighlight();
   void promptForHighlightComment();
   void storePendingHighlight();
@@ -109,6 +116,12 @@ class EpubReaderActivity final : public Activity {
   std::string extractText(const highlight::Pos& a, const highlight::Pos& b);
   std::vector<std::string> pageLineTexts(int pageIndex);
   void openHighlightsList();
+
+  // Bookmarks (whole-page marks; stored in the same sidecar file).
+  void addBookmarkForCurrentPage();  // build pendingBookmark, then the optional-comment chain
+  void promptForBookmarkComment();
+  void storePendingBookmark();
+  void openBookmarksList();
 
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
