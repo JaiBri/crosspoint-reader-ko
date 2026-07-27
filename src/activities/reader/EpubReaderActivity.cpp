@@ -51,6 +51,23 @@ int clampPercent(int percent) {
   return percent;
 }
 
+// True when a section cache was paginated under exactly the layout a sidecar
+// entry recorded. lineCompression is compared through the same x100 rounding
+// EpubReaderActivity::currentLayout() applies, so the two representations agree
+// bit-for-bit; the bools are normalised to 0/1 to match the stored uint8_t.
+bool sameLayout(const Section::CachedPagination& cached, const highlight::LayoutParams& stored) {
+  return cached.fontId == stored.fontId &&
+         static_cast<int>(cached.lineCompression * 100.0f + 0.5f) == stored.lineCompressionX100 &&
+         cached.viewportWidth == stored.viewportWidth && cached.viewportHeight == stored.viewportHeight &&
+         cached.paragraphAlignment == stored.paragraphAlignment &&
+         static_cast<uint8_t>(cached.characterWrap ? 1 : 0) == stored.characterWrap &&
+         static_cast<uint8_t>(cached.hyphenationEnabled ? 1 : 0) == stored.hyphenationEnabled &&
+         static_cast<uint8_t>(cached.embeddedStyle ? 1 : 0) == stored.embeddedStyle &&
+         cached.imageRendering == stored.imageRendering &&
+         static_cast<uint8_t>(cached.extraParagraphSpacing ? 1 : 0) == stored.extraParagraphSpacing &&
+         static_cast<uint8_t>(cached.paragraphIndent ? 1 : 0) == stored.paragraphIndent;
+}
+
 }  // namespace
 
 void EpubReaderActivity::onEnter() {
@@ -366,23 +383,70 @@ void EpubReaderActivity::jumpToPercent(int percent) {
 
   const size_t cumulative = epub->getCumulativeSpineItemSize(targetSpineIndex);
   const size_t spineSize = (cumulative > prevCumulative) ? (cumulative - prevCumulative) : 0;
-  // Store a normalized position within the spine so it can be applied once loaded.
-  pendingSpineProgress =
+  const float spineFraction =
       (spineSize == 0) ? 0.0f : static_cast<float>(targetSize - prevCumulative) / static_cast<float>(spineSize);
-  if (pendingSpineProgress < 0.0f) {
-    pendingSpineProgress = 0.0f;
-  } else if (pendingSpineProgress > 1.0f) {
-    pendingSpineProgress = 1.0f;
+  jumpToSpineFraction(targetSpineIndex, spineFraction);
+}
+
+// Defer repositioning until render() has loaded the target section, at which
+// point section->pageCount is authoritative for the CURRENT layout (see the
+// pendingPercentJump handling in render()). Resolving to a page any earlier
+// would have to trust a cached page count that may have been produced under a
+// different layout.
+void EpubReaderActivity::jumpToSpineFraction(const int spineIndex, const float spineFraction) {
+  float f = spineFraction;
+  if (!(f >= 0.0f)) {
+    f = 0.0f;  // also catches NaN
+  } else if (f > 1.0f) {
+    f = 1.0f;
   }
 
   // Reset state so render() reloads and repositions on the target spine.
   {
     RenderLock lock(*this);
-    currentSpineIndex = targetSpineIndex;
+    pendingSpineProgress = f;
+    currentSpineIndex = spineIndex;
     nextPageNumber = 0;
     pendingPercentJump = true;
     section.reset();
   }
+}
+
+// Decode a bookmark's book-progress anchor into (spine, intra-spine fraction).
+//
+// The stored spine index is itself layout-independent (spine sizes come from
+// uncompressed ZIP bytes), so it is trusted directly rather than re-derived by
+// scanning cumulative sizes for the percentage. That is both cheaper — two
+// lookups instead of up to spineCount — and makes it impossible for float
+// rounding to land the jump in a neighbouring chapter.
+bool EpubReaderActivity::bookPctToSpineTarget(const highlight::Bookmark& bm, int& spineOut, float& fracOut) const {
+  if (!epub || !highlight::pctValid(bm.pctX10000)) {
+    return false;
+  }
+  const int spineCount = epub->getSpineItemsCount();
+  const int spine = static_cast<int>(bm.spine);
+  if (spine < 0 || spine >= spineCount) {
+    return false;
+  }
+
+  const size_t bookSize = epub->getBookSize();
+  const size_t prevCumulative = (spine > 0) ? epub->getCumulativeSpineItemSize(spine - 1) : 0;
+  const size_t cumulative = epub->getCumulativeSpineItemSize(spine);
+  if (bookSize == 0 || cumulative <= prevCumulative) {
+    return false;
+  }
+
+  const double fraction = static_cast<double>(bm.pctX10000) / static_cast<double>(highlight::PCT_SCALE);
+  auto target = static_cast<size_t>(fraction * static_cast<double>(bookSize) + 0.5);
+  // Clamp into the bookmark's own chapter: the anchor is quantised, so a
+  // bookmark at a chapter edge can round just outside it.
+  if (target < prevCumulative) target = prevCumulative;
+  if (target > cumulative - 1) target = cumulative - 1;
+
+  const size_t spineSize = cumulative - prevCumulative;
+  spineOut = spine;
+  fracOut = static_cast<float>(target - prevCumulative) / static_cast<float>(spineSize);
+  return true;
 }
 
 void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action) {
@@ -786,12 +850,11 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     }
 
     if (pendingPercentJump && section->pageCount > 0) {
-      // Apply the pending percent jump now that we know the new section's page count.
-      int newPage = static_cast<int>(pendingSpineProgress * static_cast<float>(section->pageCount));
-      if (newPage >= section->pageCount) {
-        newPage = section->pageCount - 1;
-      }
-      section->currentPage = newPage;
+      // Apply the pending percent jump now that we know the new section's page
+      // count. Shares highlight::pageForFraction with the bookmark anchor
+      // encoder, so the page->fraction->page identity the unit tests prove also
+      // holds on device (same clamping, same truncation as before).
+      section->currentPage = highlight::pageForFraction(pendingSpineProgress, section->pageCount);
       pendingPercentJump = false;
     }
   }
@@ -1245,6 +1308,65 @@ void EpubReaderActivity::loadSidecarIfNeeded() {
     std::sort(bookmarks.begin(), bookmarks.end(), highlight::bookmarkLess);
     LOG_DBG("ERS", "Loaded %u highlights, %u bookmarks", static_cast<uint32_t>(highlights.size()),
             static_cast<uint32_t>(bookmarks.size()));
+    migrateBookmarkPercentages();
+  }
+}
+
+// Give pre-`pc=` bookmarks a layout-independent anchor, but ONLY where it can be
+// derived exactly — that is, where the chapter's section cache was paginated
+// under the very layout the bookmark recorded, so its stored page index is
+// provably meaningful.
+//
+// Placement matters: this runs from onEnter() BEFORE the first requestUpdate(),
+// so nothing has repaginated yet this session and each bookmarked spine's cache
+// still holds the layout it was last read under. Move this after any render and
+// the exact-match rate collapses.
+//
+// Bookmarks that cannot be converted exactly are left completely alone. An
+// approximate conversion would be actively harmful: when the cache has already
+// been rebuilt at today's layout, encoding page P and decoding it again returns
+// P, so it would "convert" the bookmark to an anchor meaning today's stale page
+// — freezing an error that otherwise self-heals the next time the chapter is
+// paginated under the original layout.
+void EpubReaderActivity::migrateBookmarkPercentages() {
+  if (!epub) {
+    return;
+  }
+  const bool anyMissing = std::any_of(bookmarks.begin(), bookmarks.end(), [](const highlight::Bookmark& b) {
+    return !highlight::pctValid(b.pctX10000);
+  });
+  if (!anyMissing) {
+    return;
+  }
+
+  // Bookmarks are sorted by spine, so a single-entry memo collapses the common
+  // case of several bookmarks in one chapter to one header read.
+  int cachedSpine = -1;
+  bool cachedOk = false;
+  Section::CachedPagination cached;
+
+  int converted = 0, skipped = 0;
+  for (auto& bm : bookmarks) {
+    if (highlight::pctValid(bm.pctX10000)) {
+      continue;
+    }
+    if (static_cast<int>(bm.spine) != cachedSpine) {
+      cachedSpine = static_cast<int>(bm.spine);
+      cachedOk = Section::readCachedPagination(Section::cacheFilePath(epub->getCachePath(), cachedSpine), cached);
+    }
+    if (!cachedOk || cached.pageCount == 0 || bm.page >= cached.pageCount || !sameLayout(cached, bm.layout)) {
+      skipped++;
+      continue;
+    }
+    const float spineFraction = highlight::pageCentreFraction(bm.page, cached.pageCount);
+    bm.pctX10000 = highlight::encodePct(epub->calculateProgress(cachedSpine, spineFraction));
+    converted++;
+  }
+
+  LOG_DBG("ERS", "Bookmark migration: %d converted, %d left on the page fallback", converted, skipped);
+  if (converted > 0) {
+    std::sort(bookmarks.begin(), bookmarks.end(), highlight::bookmarkLess);
+    saveSidecar();
   }
 }
 
@@ -1846,7 +1968,14 @@ void EpubReaderActivity::openBookmarksList() {
   for (const auto& b : bookmarks) {
     SidecarListActivity::Row r;
     const std::string marker = b.note.empty() ? "" : "* ";
-    r.label = marker + "Ch " + std::to_string(b.spine + 1) + " p" + std::to_string(b.page + 1) +
+    // Position goes BEFORE the snippet: the list draws one truncated line, so
+    // anything after the snippet would be the first thing clipped. A migrated
+    // bookmark shows its book percentage, one still on the page fallback keeps
+    // the old "pN" form — so the list also reads as migration state.
+    const std::string position = highlight::pctValid(b.pctX10000)
+                                     ? std::to_string(highlight::pctToDisplayPercent(b.pctX10000)) + "%"
+                                     : "p" + std::to_string(b.page + 1);
+    r.label = marker + "Ch " + std::to_string(b.spine + 1) + " " + position +
               (b.text.empty() ? std::string("") : ": " + b.text);
     r.body = b.text;
     r.note = b.note;
@@ -1873,7 +2002,22 @@ void EpubReaderActivity::openBookmarksList() {
       [this](const ActivityResult& result) {
         if (!result.isCancelled && std::holds_alternative<SyncResult>(result.data)) {
           const auto& jump = std::get<SyncResult>(result.data);
-          if (currentSpineIndex != jump.spineIndex || (section && section->currentPage != jump.page)) {
+          // Rows carry (spine, page), so find the bookmark they came from to
+          // recover its anchor. Matching on the pair rather than a row index
+          // keeps SyncResult — which is shared with the KOReader sync flow —
+          // untouched.
+          const auto it = std::find_if(bookmarks.begin(), bookmarks.end(), [&](const highlight::Bookmark& b) {
+            return static_cast<int>(b.spine) == jump.spineIndex && static_cast<int>(b.page) == jump.page;
+          });
+
+          int targetSpine = 0;
+          float targetFraction = 0.0f;
+          if (it != bookmarks.end() && bookPctToSpineTarget(*it, targetSpine, targetFraction)) {
+            // Layout-independent path: render() resolves the fraction to a page
+            // once the section has been paginated under the current settings.
+            jumpToSpineFraction(targetSpine, targetFraction);
+          } else if (currentSpineIndex != jump.spineIndex || (section && section->currentPage != jump.page)) {
+            // Pre-`pc=` bookmark: fall back to the stored page as before.
             RenderLock lock(*this);
             currentSpineIndex = jump.spineIndex;
             nextPageNumber = jump.page;
@@ -1888,16 +2032,34 @@ void EpubReaderActivity::addBookmarkForCurrentPage() {
   if (!section) {
     return;
   }
-  pendingBookmark = highlight::Bookmark{};
-  pendingBookmark.spine = static_cast<uint16_t>(currentSpineIndex);
-  pendingBookmark.page = static_cast<uint16_t>(section->currentPage);
-  pendingBookmark.layout = currentLayout();
-  // Human-readable label = the first non-empty line of the current page.
-  const auto texts = pageLineTexts(section->currentPage);
-  for (const auto& t : texts) {
-    if (!t.empty()) {
-      pendingBookmark.text = t;
-      break;
+  // Everything the bookmark needs must be captured HERE: promptForBookmarkComment()
+  // runs asynchronously across two sub-activities via pendingBookmark, and
+  // `section` may be gone by the time its callbacks fire.
+  //
+  // The capture is locked because render() runs on its own FreeRTOS task and
+  // owns section->currentPage / pageCount / hlViewportW/H. pageLineTexts()
+  // transiently mutates currentPage, and a torn read of pageCount == 0 would
+  // make the progress division produce NaN — which converts to a garbage anchor
+  // that then gets written permanently to the user's sidecar. The lock is
+  // released before the prompt: holding it across startActivityForResult() is a
+  // deadlock risk.
+  {
+    RenderLock lock(*this);
+    pendingBookmark = highlight::Bookmark{};
+    pendingBookmark.spine = static_cast<uint16_t>(currentSpineIndex);
+    pendingBookmark.page = static_cast<uint16_t>(section->currentPage);
+    pendingBookmark.layout = currentLayout();
+    if (epub && section->pageCount > 0) {
+      const float spineFraction = highlight::pageCentreFraction(section->currentPage, section->pageCount);
+      pendingBookmark.pctX10000 = highlight::encodePct(epub->calculateProgress(currentSpineIndex, spineFraction));
+    }
+    // Human-readable label = the first non-empty line of the current page.
+    const auto texts = pageLineTexts(section->currentPage);
+    for (const auto& t : texts) {
+      if (!t.empty()) {
+        pendingBookmark.text = t;
+        break;
+      }
     }
   }
   promptForBookmarkComment();  // ask whether to attach a comment, then store

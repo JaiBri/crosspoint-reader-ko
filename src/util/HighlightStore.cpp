@@ -106,6 +106,13 @@ std::string metaCommentBookmark(const Bookmark& b) {
   s += std::to_string(b.spine);
   s += " p=" + std::to_string(b.page);
   s += " ly=" + serializeLayout(b.layout);
+  // Appended AFTER ly= so the leading portion of the line is unchanged from the
+  // pre-`pc=` format. No version bump is needed: parseBookmarkMeta skips tokens
+  // whose key matches no branch and requires only sp/p/ly, so older firmware
+  // reads these lines fine (it will, however, drop `pc=` when it next writes).
+  if (pctValid(b.pctX10000)) {
+    s += " pc=" + std::to_string(b.pctX10000);
+  }
   s += " -->";
   return s;
 }
@@ -174,6 +181,14 @@ bool parseBookmarkMeta(const std::string& line, Bookmark& out) {
     } else if (key == "ly") {
       if (!parseLayout(val, out.layout)) return false;
       haveLy = true;
+    } else if (key == "pc") {
+      // Optional. Unlike sp/p/ly this must NEVER reject the line — a malformed
+      // or out-of-range anchor degrades the bookmark to the (spine, page)
+      // fallback, whereas returning false would silently drop it entirely.
+      long v;
+      if (parseInt(val, v) && v >= 0 && v <= PCT_SCALE) {
+        out.pctX10000 = static_cast<int32_t>(v);
+      }
     }
   }
   return haveSp && haveP && haveLy;
@@ -191,7 +206,42 @@ bool highlightLess(const Highlight& a, const Highlight& b) {
 
 bool bookmarkLess(const Bookmark& a, const Bookmark& b) {
   if (a.spine != b.spine) return a.spine < b.spine;
+  // Prefer the layout-independent anchor; `page` may be stale on either side.
+  if (pctValid(a.pctX10000) && pctValid(b.pctX10000) && a.pctX10000 != b.pctX10000) {
+    return a.pctX10000 < b.pctX10000;
+  }
   return a.page < b.page;
+}
+
+float pageCentreFraction(const int page, const int pageCount) {
+  if (pageCount <= 0) return 0.0f;
+  int p = page;
+  if (p < 0) p = 0;
+  if (p >= pageCount) p = pageCount - 1;
+  return (static_cast<float>(p) + 0.5f) / static_cast<float>(pageCount);
+}
+
+int pageForFraction(const float fraction, const int pageCount) {
+  if (pageCount <= 0) return 0;
+  float f = fraction;
+  if (!(f >= 0.0f)) f = 0.0f;  // also catches NaN
+  if (f > 1.0f) f = 1.0f;
+  int page = static_cast<int>(f * static_cast<float>(pageCount));
+  if (page >= pageCount) page = pageCount - 1;
+  if (page < 0) page = 0;
+  return page;
+}
+
+int32_t encodePct(const float bookFraction) {
+  float f = bookFraction;
+  if (!(f >= 0.0f)) f = 0.0f;  // also catches NaN
+  if (f > 1.0f) f = 1.0f;
+  return static_cast<int32_t>(f * static_cast<float>(PCT_SCALE) + 0.5f);
+}
+
+int pctToDisplayPercent(const int32_t pct) {
+  if (!pctValid(pct)) return 0;
+  return static_cast<int>((pct + PCT_SCALE / 200) / (PCT_SCALE / 100));
 }
 
 std::string serialize(const std::string& bookTitle, const std::vector<Highlight>& items,
@@ -215,7 +265,13 @@ std::string serialize(const std::string& bookTitle, const std::vector<Highlight>
     out += metaComment(h) + "\n\n";
   }
   for (const auto& b : sortedB) {
-    out += "## Bookmark — Chapter " + std::to_string(b.spine + 1) + ", Page " + std::to_string(b.page + 1) + "\n";
+    out += "## Bookmark — Chapter " + std::to_string(b.spine + 1) + ", Page " + std::to_string(b.page + 1);
+    // Decorative only (headings are skipped on parse), but it is the point of
+    // preferring Markdown over JSON: the file should read well on a PC.
+    if (pctValid(b.pctX10000)) {
+      out += " (" + std::to_string(pctToDisplayPercent(b.pctX10000)) + "%)";
+    }
+    out += "\n";
     if (!b.text.empty()) {
       out += "> " + oneLine(b.text) + "\n";
     }

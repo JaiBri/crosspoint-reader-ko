@@ -137,6 +137,12 @@ class EpubReaderActivity final : public Activity {
   void promptForBookmarkComment();
   void storePendingBookmark();
   void openBookmarksList();
+  // Give pre-`pc=` bookmarks a layout-independent anchor where it can be derived
+  // exactly. Must run before the first render — see the definition.
+  void migrateBookmarkPercentages();
+  // Decode a bookmark's book-progress anchor into (spine, intra-spine fraction).
+  // False when the bookmark has no anchor or the book metadata is unusable.
+  bool bookPctToSpineTarget(const highlight::Bookmark& bm, int& spineOut, float& fracOut) const;
 
   void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
@@ -145,6 +151,10 @@ class EpubReaderActivity final : public Activity {
   void saveProgress(int spineIndex, int currentPage, int pageCount);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);
+  // Jump to a normalized 0.0-1.0 position within a known spine item. The page is
+  // resolved by render() once the section is paginated at the current settings,
+  // so this is safe across layout changes (unlike a stored page index).
+  void jumpToSpineFraction(int spineIndex, float spineFraction);
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
   void applyOrientation(uint8_t orientation);
   void toggleAutoPageTurn(uint8_t selectedPageTurnOption);

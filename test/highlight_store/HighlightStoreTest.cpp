@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "util/HighlightStore.h"
@@ -55,6 +56,21 @@ static Highlight makeHl(uint16_t spine, Pos start, Pos end, const std::string& t
 static bool sameHl(const Highlight& a, const Highlight& b) {
   return a.spine == b.spine && highlight::posEqual(a.start, b.start) && highlight::posEqual(a.end, b.end) &&
          a.layout == b.layout && a.text == b.text && a.note == b.note;
+}
+
+static Bookmark makeBm(uint16_t spine, uint16_t page, int32_t pct, const std::string& text) {
+  Bookmark b;
+  b.spine = spine;
+  b.page = page;
+  b.pctX10000 = pct;
+  b.layout = sampleLayout();
+  b.text = text;
+  return b;
+}
+
+static bool sameBm(const Bookmark& a, const Bookmark& b) {
+  return a.spine == b.spine && a.page == b.page && a.pctX10000 == b.pctX10000 && a.layout == b.layout &&
+         a.text == b.text && a.note == b.note;
 }
 
 static void testRoundTrip() {
@@ -224,24 +240,174 @@ static void testBookmarkRoundTrip() {
   b.layout.fontId = -1446433084;  // hashed font id is signed — must round-trip
   b.text = "On giving up the idea that";
   b.note = "revisit this";
+  b.pctX10000 = 4567;
   bms.push_back(b);
 
   const std::string md = highlight::serialize("On Giving Up", none, bms);
-  CHECK(md.find("## Bookmark — Chapter 5, Page 12") != std::string::npos);
+  CHECK(md.find("## Bookmark — Chapter 5, Page 12 (46%)") != std::string::npos);
+  // The pre-`pc=` prefix must be byte-identical; `pc=` is appended after `ly=`.
   CHECK(md.find("<!-- cpx-bm v1 sp=4 p=11 ly=-1446433084,") != std::string::npos);
+  CHECK(md.find(" pc=4567 -->") != std::string::npos);
 
   const auto back = highlight::parseBookmarks(md);
   CHECK(back.size() == 1);
   if (back.size() == 1) {
     CHECK(back[0].spine == 4);
     CHECK(back[0].page == 11);
+    CHECK(back[0].pctX10000 == 4567);
     CHECK(back[0].layout.fontId == -1446433084);
     CHECK(back[0].layout == b.layout);
     CHECK(back[0].text == "On giving up the idea that");
     CHECK(back[0].note == "revisit this");
+    CHECK(sameBm(back[0], b));
   }
   // A bookmark-only file has no highlights.
   CHECK(highlight::parse(md).empty());
+}
+
+// A bookmark with no anchor must not emit `pc=` at all, and must read back as
+// PCT_ABSENT rather than silently becoming 0%.
+static void testBookmarkPercentAbsentOmitted() {
+  std::vector<Highlight> none;
+  std::vector<Bookmark> bms;
+  bms.push_back(makeBm(1, 2, highlight::PCT_ABSENT, "no anchor yet"));
+
+  const std::string md = highlight::serialize("Absent", none, bms);
+  CHECK(md.find(" pc=") == std::string::npos);
+  CHECK(md.find("(0%)") == std::string::npos);
+  CHECK(md.find("## Bookmark — Chapter 2, Page 3\n") != std::string::npos);
+
+  const auto back = highlight::parseBookmarks(md);
+  CHECK(back.size() == 1);
+  if (back.size() == 1) {
+    CHECK(back[0].pctX10000 == highlight::PCT_ABSENT);
+    CHECK(!highlight::pctValid(back[0].pctX10000));
+  }
+}
+
+// A sidecar written before `pc=` existed must still load, on the page fallback.
+static void testBookmarkLegacyLineParses() {
+  const std::string md =
+      "# Highlights — Legacy\n\n"
+      "## Bookmark — Chapter 3, Page 8\n"
+      "> legacy bookmark\n"
+      "<!-- cpx-bm v1 sp=2 p=7 ly=4,90,400,560,1,0,1,1,2,0,1 -->\n\n";
+
+  const auto back = highlight::parseBookmarks(md);
+  CHECK(back.size() == 1);
+  if (back.size() == 1) {
+    CHECK(back[0].spine == 2);
+    CHECK(back[0].page == 7);
+    CHECK(back[0].pctX10000 == highlight::PCT_ABSENT);
+    CHECK(back[0].text == "legacy bookmark");
+    CHECK(back[0].layout == sampleLayout());
+  }
+}
+
+// Unknown keys are ignored rather than rejecting the line. This is the property
+// that lets `pc=` be added without a version bump, so it is worth locking in.
+static void testBookmarkUnknownKeyIgnored() {
+  const std::string md =
+      "## Bookmark — Chapter 1, Page 1\n"
+      "> forward compatible\n"
+      "<!-- cpx-bm v1 sp=0 p=0 zz=9 ly=4,90,400,560,1,0,1,1,2,0,1 xp=/body/x -->\n\n";
+
+  const auto back = highlight::parseBookmarks(md);
+  CHECK(back.size() == 1);
+  if (back.size() == 1) {
+    CHECK(back[0].spine == 0);
+    CHECK(back[0].page == 0);
+    CHECK(back[0].text == "forward compatible");
+  }
+}
+
+// A malformed or out-of-range `pc=` must degrade the bookmark to the page
+// fallback, NOT drop it — unlike sp/p/ly, which are required.
+static void testBookmarkBadPercentIsIgnoredNotFatal() {
+  // "pc=45.67" covers the no-float-parser path: parseInt requires the whole
+  // value to be consumed, so a decimal is rejected rather than truncated to 45.
+  const char* const bad[] = {"pc=99999", "pc=-7", "pc=abc", "pc=", "pc=10001", "pc=45.67", "pc=0x10"};
+  for (const char* tok : bad) {
+    const std::string md = std::string(
+                               "## Bookmark — Chapter 1, Page 2\n"
+                               "> resilient\n"
+                               "<!-- cpx-bm v1 sp=0 p=1 ly=4,90,400,560,1,0,1,1,2,0,1 ") +
+                           tok + " -->\n\n";
+    const auto back = highlight::parseBookmarks(md);
+    CHECK(back.size() == 1);
+    if (back.size() == 1) {
+      CHECK(back[0].spine == 0);
+      CHECK(back[0].page == 1);
+      CHECK(back[0].pctX10000 == highlight::PCT_ABSENT);
+    }
+  }
+  // Boundary values that ARE valid must still be accepted.
+  for (const auto& [tok, want] : std::vector<std::pair<std::string, int32_t>>{{"pc=0", 0}, {"pc=10000", 10000}}) {
+    const std::string md = "<!-- cpx-bm v1 sp=0 p=1 ly=4,90,400,560,1,0,1,1,2,0,1 " + tok + " -->\n";
+    const auto back = highlight::parseBookmarks(md);
+    CHECK(back.size() == 1);
+    if (back.size() == 1) {
+      CHECK(back[0].pctX10000 == want);
+    }
+  }
+}
+
+// Encoding the page CENTRE makes page->fraction->page an exact identity, which
+// is what stops a jump drifting every time a bookmark is re-resolved.
+static void testPageFractionRoundTrip() {
+  for (const int n : {1, 2, 3, 7, 50, 997}) {
+    for (int p = 0; p < n; p++) {
+      CHECK(highlight::pageForFraction(highlight::pageCentreFraction(p, n), n) == p);
+    }
+  }
+  // Clamping and degenerate inputs.
+  CHECK(highlight::pageCentreFraction(-5, 10) == highlight::pageCentreFraction(0, 10));
+  CHECK(highlight::pageCentreFraction(99, 10) == highlight::pageCentreFraction(9, 10));
+  CHECK(highlight::pageCentreFraction(0, 0) == 0.0f);
+  CHECK(highlight::pageForFraction(-1.0f, 10) == 0);
+  CHECK(highlight::pageForFraction(2.0f, 10) == 9);
+  CHECK(highlight::pageForFraction(0.5f, 0) == 0);
+}
+
+static void testEncodePctClamp() {
+  CHECK(highlight::encodePct(-0.1f) == 0);
+  CHECK(highlight::encodePct(0.0f) == 0);
+  CHECK(highlight::encodePct(1.0f) == highlight::PCT_SCALE);
+  CHECK(highlight::encodePct(1.5f) == highlight::PCT_SCALE);
+  CHECK(highlight::encodePct(0.45674f) == 4567);
+  CHECK(highlight::pctToDisplayPercent(4567) == 46);
+  CHECK(highlight::pctToDisplayPercent(4500) == 45);
+  CHECK(highlight::pctToDisplayPercent(0) == 0);
+  CHECK(highlight::pctToDisplayPercent(highlight::PCT_SCALE) == 100);
+  CHECK(highlight::pctToDisplayPercent(highlight::PCT_ABSENT) == 0);
+}
+
+// Once bookmarks carry an anchor the list must order by it — sorting by the
+// stored page would keep using indices that a layout change already invalidated.
+static void testBookmarkSortUsesPercent() {
+  std::vector<Highlight> none;
+  std::vector<Bookmark> bms;
+  bms.push_back(makeBm(3, 9, 5000, "later in the book"));
+  bms.push_back(makeBm(3, 2, 1000, "earlier in the book"));
+
+  const std::string md = highlight::serialize("Sorted", none, bms);
+  const auto back = highlight::parseBookmarks(md);
+  CHECK(back.size() == 2);
+  if (back.size() == 2) {
+    CHECK(back[0].pctX10000 == 1000);
+    CHECK(back[1].pctX10000 == 5000);
+  }
+
+  // With no anchors, ordering falls back to the page index.
+  std::vector<Bookmark> legacy;
+  legacy.push_back(makeBm(3, 9, highlight::PCT_ABSENT, "page nine"));
+  legacy.push_back(makeBm(3, 2, highlight::PCT_ABSENT, "page two"));
+  const auto backLegacy = highlight::parseBookmarks(highlight::serialize("Legacy", none, legacy));
+  CHECK(backLegacy.size() == 2);
+  if (backLegacy.size() == 2) {
+    CHECK(backLegacy[0].page == 2);
+    CHECK(backLegacy[1].page == 9);
+  }
 }
 
 static void testMixedFileNoCrossContamination() {
@@ -288,6 +454,13 @@ int main() {
   testNegativeFontId();
   testBookmarkRoundTrip();
   testMixedFileNoCrossContamination();
+  testBookmarkPercentAbsentOmitted();
+  testBookmarkLegacyLineParses();
+  testBookmarkUnknownKeyIgnored();
+  testBookmarkBadPercentIsIgnoredNotFatal();
+  testPageFractionRoundTrip();
+  testEncodePctClamp();
+  testBookmarkSortUsesPercent();
 
   if (g_failures == 0) {
     std::printf("HighlightStore: ALL TESTS PASSED\n");

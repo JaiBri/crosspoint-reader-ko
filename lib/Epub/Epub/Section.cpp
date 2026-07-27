@@ -133,6 +133,54 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
   return true;
 }
 
+std::string Section::cacheFilePath(const std::string& cachePath, const int spineIndex) {
+  return cachePath + "/sections/" + std::to_string(spineIndex) + ".bin";
+}
+
+bool Section::readCachedPagination(const std::string& sectionFilePath, CachedPagination& out) {
+  FsFile f;
+  if (!Storage.openFileForRead("SCT", sectionFilePath, f)) {
+    return false;
+  }
+
+  // serialization::readPod ignores the underlying read() result, so a short file
+  // would leave the destinations uninitialised. Guard on size up front — the
+  // values feed a bookmark anchor that gets written back to the user's sidecar,
+  // where garbage would be permanent.
+  if (f.size() < HEADER_SIZE) {
+    f.close();
+    LOG_DBG("SCT", "Cached pagination: file shorter than header (%lu)", static_cast<unsigned long>(f.size()));
+    return false;
+  }
+
+  uint8_t version;
+  serialization::readPod(f, version);
+  if (version != SECTION_FILE_VERSION) {
+    f.close();
+    LOG_DBG("SCT", "Cached pagination: version %u != %u", version, SECTION_FILE_VERSION);
+    return false;
+  }
+
+  // Field order must match writeSectionFileHeader() exactly.
+  CachedPagination p;
+  serialization::readPod(f, p.fontId);
+  serialization::readPod(f, p.lineCompression);
+  serialization::readPod(f, p.extraParagraphSpacing);
+  serialization::readPod(f, p.paragraphIndent);
+  serialization::readPod(f, p.paragraphAlignment);
+  serialization::readPod(f, p.characterWrap);
+  serialization::readPod(f, p.viewportWidth);
+  serialization::readPod(f, p.viewportHeight);
+  serialization::readPod(f, p.hyphenationEnabled);
+  serialization::readPod(f, p.embeddedStyle);
+  serialization::readPod(f, p.imageRendering);
+  serialization::readPod(f, p.pageCount);
+  f.close();
+
+  out = p;
+  return true;
+}
+
 // Your updated class method (assuming you are using the 'SD' object, which is a wrapper for a specific filesystem)
 bool Section::clearCache() const {
   if (!Storage.exists(filePath.c_str())) {
