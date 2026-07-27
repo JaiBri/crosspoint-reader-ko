@@ -62,6 +62,8 @@ inline const std::vector<SettingInfo>& getSettingsList() {
                             StrId::STR_CAT_READER),
         SettingInfo::Toggle(StrId::STR_TEXT_AA, &CrossPointSettings::textAntiAliasing, "textAntiAliasing",
                             StrId::STR_CAT_READER),
+        SettingInfo::Toggle(StrId::STR_SHOW_TIME_REMAINING, &CrossPointSettings::showTimeRemaining,
+                            "showTimeRemaining", StrId::STR_CAT_READER),
         SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
                           {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER, StrId::STR_IMAGES_SUPPRESS},
                           "imageRendering", StrId::STR_CAT_READER),

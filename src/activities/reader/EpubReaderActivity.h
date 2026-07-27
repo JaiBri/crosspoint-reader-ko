@@ -10,6 +10,7 @@
 #include "EpubReaderMenuActivity.h"
 #include "activities/Activity.h"
 #include "util/HighlightStore.h"
+#include "util/ReadingSpeedStore.h"
 #include "util/ReadingTimer.h"
 
 class Page;
@@ -40,6 +41,18 @@ class EpubReaderActivity final : public Activity {
   // Per-book reading-time accumulator. Loaded in onEnter, ticked in loop,
   // saved on mid-cadence and onExit. See util/ReadingTimer.h for semantics.
   ReadingTimer readingTimer;
+
+  // Reading-speed tracking: per-page durations -> median -> "time left" estimate.
+  // A page's duration is the delta of readingTimer.totalSeconds() across a
+  // forward page turn, so menu/idle time is already excluded. Raw durations are
+  // logged to the global /.crosspoint/reading_speed.md (util/ReadingSpeedStore.h).
+  readingspeed::Library readingLibrary;
+  uint32_t pageStartActiveSec = 0;     // readingTimer.totalSeconds() when the current page became visible
+  int timedSpine = -1;                 // (spine,page) that pageStartActiveSec refers to; -1 = none yet
+  int timedPage = -1;                  // re-anchored in render() whenever the displayed page changes
+  uint32_t medianSecPerPageCache = 0;  // median over this book's realistic durations (0 = none)
+  size_t medianSampleCount = 0;        // #realistic samples behind the median
+  int recordedSinceFlush = 0;          // durations recorded since the last SD write
 
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
@@ -79,7 +92,8 @@ class EpubReaderActivity final : public Activity {
   bool highlightMode = false;          // in highlight-selection sub-mode
   bool hlSelecting = false;            // start anchor placed, extending to cursor
   HlPending hlPending = HlPending::None;
-  highlight::Pos hlAnchor;             // selection start (page-relative, current chapter)
+  highlight::Pos hlAnchor;             // locked start word's start (page-relative, current chapter)
+  highlight::Pos hlAnchorEnd;          // locked start word's end (used when extending backward)
   highlight::Pos hlCursor;             // moving cursor
   highlight::Highlight pendingHighlight;  // built on commit, stored after the optional-comment chain
   std::vector<highlight::Highlight> highlights;  // loaded for this book
@@ -101,8 +115,9 @@ class EpubReaderActivity final : public Activity {
   // Word-granular cursor navigation over the current page geometry (pageGeom).
   int hlWordIndex(const HlLine& line, int ch) const;  // word containing/at ch, or -1 if line empty
   int hlCursorWordEnd() const;                        // logical-char end of the word under the cursor
-  void hlMoveForwardWord();   // Down/Right: next word, turning the page at the end
-  void hlMoveBackwardWord();  // Up/Left: previous word, turning the page at the start
+  void hlMoveForwardWord();   // Right: next word, turning the page at the end
+  void hlMoveBackwardWord();  // Left: previous word, turning the page at the start
+  void hlMoveLine(int dir);   // Up(-1)/Down(+1): word nearest the cursor's x in the adjacent line
   void commitHighlight();
   void promptForHighlightComment();
   void storePendingHighlight();
@@ -134,6 +149,12 @@ class EpubReaderActivity final : public Activity {
   void applyOrientation(uint8_t orientation);
   void toggleAutoPageTurn(uint8_t selectedPageTurnOption);
   void pageTurn(bool isForwardTurn);
+
+  // Reading-speed helpers (see the readingLibrary members above).
+  void loadReadingSpeed();                     // parse the global file + prime the median cache
+  void recordPageDuration(uint32_t seconds);   // append one page's reading time + periodic flush
+  void saveReadingSpeed();                     // serialize the whole library to SD
+  void refreshMedianCache();                   // recompute median/sample-count for the current book
 
   // Footnote navigation
   void navigateToHref(const std::string& href, bool savePosition = false);

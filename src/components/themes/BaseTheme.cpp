@@ -682,7 +682,7 @@ void BaseTheme::fillPopupProgress(const GfxRenderer& renderer, const Rect& layou
 
 void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage,
                               const int pageCount, std::string title, const int paddingBottom,
-                              const int textYOffset) const {
+                              const int textYOffset, const std::string& timeRemaining) const {
   auto metrics = UITheme::getInstance().getMetrics();
   int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
   renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
@@ -693,8 +693,11 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
   auto textY = screenHeight - UITheme::getInstance().getStatusBarHeight() - orientedMarginBottom - paddingBottom - 4;
   int progressTextWidth = 0;
 
+  // Right-aligned cluster: the page/percent counter (per the user's toggles)
+  // plus an optional "~Xh Ym" time-remaining estimate appended after it, so
+  // enabling "Book progress %" + "Show time remaining" reads as "45%  ~2h 15m".
+  std::string rightText;
   if (SETTINGS.statusBarBookProgressPercentage || SETTINGS.statusBarChapterPageCount) {
-    // Right aligned text for progress counter
     char progressStr[32];
 
     if (SETTINGS.statusBarBookProgressPercentage && SETTINGS.statusBarChapterPageCount) {
@@ -704,12 +707,19 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     } else {
       snprintf(progressStr, sizeof(progressStr), "%d/%d", currentPage, pageCount);
     }
+    rightText = progressStr;
+  }
+  if (!timeRemaining.empty()) {
+    if (!rightText.empty()) rightText += "  ";
+    rightText += timeRemaining;
+  }
 
-    progressTextWidth = renderer.getTextWidth(SMALL_FONT_ID, progressStr);
+  if (!rightText.empty()) {
+    progressTextWidth = renderer.getTextWidth(SMALL_FONT_ID, rightText.c_str());
     renderer.drawText(
         SMALL_FONT_ID,
         renderer.getScreenWidth() - metrics.statusBarHorizontalMargin - orientedMarginRight - progressTextWidth, textY,
-        progressStr);
+        rightText.c_str());
   }
 
   // Draw Progress Bar

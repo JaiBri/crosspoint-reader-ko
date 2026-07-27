@@ -101,6 +101,9 @@ void EpubReaderActivity::onEnter() {
   // Begin per-book reading time accumulation. Cache dir was just ensured above.
   readingTimer.start(epub->getCachePath());
 
+  // Load the global reading-speed log and prime this book's median estimate.
+  loadReadingSpeed();
+
   // Load existing highlights for this book (sidecar Markdown next to the file).
   loadSidecarIfNeeded();
 
@@ -113,6 +116,9 @@ void EpubReaderActivity::onExit() {
 
   // Persist accumulated session time before tearing down the book.
   readingTimer.stop();
+
+  // Final flush of any page durations recorded since the last periodic save.
+  saveReadingSpeed();
 
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
@@ -590,6 +596,17 @@ void EpubReaderActivity::toggleAutoPageTurn(const uint8_t selectedPageTurnOption
 }
 
 void EpubReaderActivity::pageTurn(bool isForwardTurn) {
+  // Reading-speed: a forward turn ends a page of sequential reading. Record the
+  // active-reading seconds spent on the page being left (menu/idle time is
+  // already excluded by readingTimer). Skipped during auto page-turn (its fixed
+  // cadence isn't reading speed) and when the snapshot doesn't match the page
+  // currently on screen (e.g. right after a jump, before its render re-anchors).
+  if (isForwardTurn && !automaticPageTurnActive && section && currentSpineIndex == timedSpine &&
+      section->currentPage == timedPage) {
+    const uint32_t nowSec = readingTimer.totalSeconds();
+    if (nowSec >= pageStartActiveSec) recordPageDuration(nowSec - pageStartActiveSec);
+  }
+
   if (isForwardTurn) {
     if (section->currentPage < section->pageCount - 1) {
       section->currentPage++;
@@ -617,6 +634,39 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
   }
   lastPageTurnTime = millis();
   requestUpdate();
+}
+
+void EpubReaderActivity::loadReadingSpeed() {
+  readingLibrary = readingspeed::parse(std::string(Storage.readFile("/.crosspoint/reading_speed.md").c_str()));
+  refreshMedianCache();
+}
+
+void EpubReaderActivity::refreshMedianCache() {
+  medianSecPerPageCache = 0;
+  medianSampleCount = 0;
+  if (!epub) return;
+  if (auto* b = readingspeed::find(readingLibrary, epub->getPath())) {
+    medianSecPerPageCache = readingspeed::medianSecPerPage(b->durations, readingspeed::kMinRealisticSec,
+                                                           readingspeed::kMaxRealisticSec, medianSampleCount);
+  }
+}
+
+void EpubReaderActivity::recordPageDuration(uint32_t seconds) {
+  if (!epub) return;
+  readingspeed::addDuration(readingLibrary, epub->getPath(), epub->getTitle(), seconds,
+                            readingspeed::kMaxDurationsPerBook);
+  refreshMedianCache();
+  // Buffer writes: flush every few pages instead of on every turn (SD wear).
+  if (++recordedSinceFlush >= 8) {
+    saveReadingSpeed();
+    recordedSinceFlush = 0;
+  }
+}
+
+void EpubReaderActivity::saveReadingSpeed() {
+  Storage.mkdir("/.crosspoint");
+  Storage.writeFile("/.crosspoint/reading_speed.md", String(readingspeed::serialize(readingLibrary).c_str()));
+  recordedSinceFlush = 0;
 }
 
 // TODO: Failure handling
@@ -785,6 +835,15 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
   saveProgress(currentSpineIndex, section->currentPage, section->pageCount);
 
+  // Reading-speed timing anchor: when a *different* page becomes visible (via a
+  // turn, jump, chapter select, sync, …), (re)start the per-page timer here so
+  // the next forward pageTurn() measures genuine on-screen dwell of this page.
+  if (currentSpineIndex != timedSpine || section->currentPage != timedPage) {
+    timedSpine = currentSpineIndex;
+    timedPage = section->currentPage;
+    pageStartActiveSec = readingTimer.totalSeconds();
+  }
+
   if (pendingScreenshot) {
     pendingScreenshot = false;
     ScreenshotUtil::takeScreenshot(renderer);
@@ -898,10 +957,14 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     }
     drawHighlightOverlay();
     if (highlightMode) {
-      // Show what the buttons do while selecting: Cancel / Start|End / move-word.
+      // Show what the buttons do while selecting. Front buttons: Back, Start|End,
+      // and previous/next word ("<" / ">"). Side buttons move by line ("^" / "v").
       const auto labels = mappedInput.mapLabels(tr(STR_BACK), hlSelecting ? tr(STR_HIGHLIGHT_END) : tr(STR_HIGHLIGHT_START),
-                                                tr(STR_PREV_WORD), tr(STR_NEXT_WORD));
+                                                "<", ">");
       GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+      // Side hints are drawn rotated 90° CW, so ">"/"<" render as up/down
+      // chevrons (matching the keyboard's Up/Down side-button convention).
+      GUI.drawSideButtonHints(renderer, ">", "<");
     }
   }
 
@@ -1039,7 +1102,31 @@ void EpubReaderActivity::renderStatusBar() const {
     title = epub->getTitle();
   }
 
-  GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset);
+  // Estimate "time left in book" from the median realistic page time. There is
+  // no whole-book page count, so derive pages-remaining from the byte fraction
+  // (bookProgress) and the current chapter's bytes-per-page; the density is
+  // recomputed every render, so the estimate self-corrects across chapters.
+  std::string timeLeft;
+  if (SETTINGS.showTimeRemaining && medianSecPerPageCache > 0 && medianSampleCount >= readingspeed::kMinSamples) {
+    const float p = bookProgress / 100.0f;  // byte fraction of the book read
+    const size_t bookSize = epub->getBookSize();
+    if (p > 0.0f && p < 1.0f && bookSize > 0 && pageCount > 0) {
+      const size_t prev = currentSpineIndex >= 1 ? epub->getCumulativeSpineItemSize(currentSpineIndex - 1) : 0;
+      const float chapterBytes = static_cast<float>(epub->getCumulativeSpineItemSize(currentSpineIndex) - prev);
+      const float bytesPerPage = chapterBytes / pageCount;
+      if (bytesPerPage > 0.0f) {
+        const float pagesLeft = (static_cast<float>(bookSize) * (1.0f - p)) / bytesPerPage;
+        if (pagesLeft > 0.0f) {
+          const uint32_t secsLeft = static_cast<uint32_t>(pagesLeft * static_cast<float>(medianSecPerPageCache));
+          char buf[12];
+          ReadingStats::format(secsLeft, buf, sizeof(buf));
+          timeLeft = std::string("~") + buf;  // e.g. "~2h 15m"
+        }
+      }
+    }
+  }
+
+  GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, timeLeft);
 }
 
 void EpubReaderActivity::navigateToHref(const std::string& hrefStr, const bool savePosition) {
@@ -1209,8 +1296,11 @@ void EpubReaderActivity::handleHighlightInput() {
   }
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     if (!hlSelecting) {
-      // First press drops the start anchor.
+      // First press locks the start word. Capture both its start (hlAnchor) and
+      // end (hlAnchorEnd) so a later backward extension can use the start word's
+      // end as the far boundary of the range.
       hlAnchor = hlCursor;
+      hlAnchorEnd = highlight::Pos{hlCursor.page, hlCursor.line, static_cast<uint16_t>(hlCursorWordEnd())};
       hlSelecting = true;
       requestUpdate();
     } else {
@@ -1225,21 +1315,25 @@ void EpubReaderActivity::handleHighlightInput() {
     return;
   }
 
-  // Word-granular selection. Forward = Down or Right, backward = Up or Left.
-  // Forward always advances a whole word (turning the page at the end so the
-  // selection flows across pages). Backward is only allowed before locking the
-  // start: once selecting, the start word's location is fixed and you cannot go
-  // back — Up/Left are ignored.
-  if (mappedInput.wasReleased(MappedInputManager::Button::Down) ||
-      mappedInput.wasReleased(MappedInputManager::Button::Right)) {
+  // 2D word selection: front Left/Right move by word, side Up/Down move by line
+  // (to the word nearest the cursor's x). Every direction is always allowed —
+  // moving before the locked start just makes the start word the far end of the
+  // range (commitHighlight/drawHighlightOverlay branch on direction), so the
+  // highlight can grow either way.
+  if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
     hlMoveForwardWord();
     return;
   }
-  if (mappedInput.wasReleased(MappedInputManager::Button::Up) ||
-      mappedInput.wasReleased(MappedInputManager::Button::Left)) {
-    if (!hlSelecting) {
-      hlMoveBackwardWord();
-    }
+  if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
+    hlMoveBackwardWord();
+    return;
+  }
+  if (mappedInput.wasReleased(MappedInputManager::Button::Down)) {
+    hlMoveLine(1);
+    return;
+  }
+  if (mappedInput.wasReleased(MappedInputManager::Button::Up)) {
+    hlMoveLine(-1);
     return;
   }
 }
@@ -1312,6 +1406,44 @@ void EpubReaderActivity::hlMoveBackwardWord() {
   highlightPageTurn(false);  // before the first word on the page -> previous page
 }
 
+void EpubReaderActivity::hlMoveLine(int dir) {
+  if (pageGeom.empty()) {
+    highlightPageTurn(dir > 0);
+    return;
+  }
+  // Horizontal target = the x of the cursor's current word, so the cursor lands
+  // roughly above/below where it is now.
+  int targetX = 0;
+  {
+    const HlLine& cur = pageGeom[hlCursor.line];
+    const int wi = hlWordIndex(cur, hlCursor.ch);
+    if (wi >= 0) targetX = cur.words[wi].x;
+  }
+  for (int li = static_cast<int>(hlCursor.line) + dir; li >= 0 && li < static_cast<int>(pageGeom.size()); li += dir) {
+    const HlLine& line = pageGeom[li];
+    if (line.words.empty()) continue;
+    // Pick the word whose first-glyph x is nearest the target x.
+    int bestW = 0;
+    int bestDx = line.words[0].x - targetX;
+    if (bestDx < 0) bestDx = -bestDx;
+    for (size_t i = 1; i < line.words.size(); i++) {
+      int dx = line.words[i].x - targetX;
+      if (dx < 0) dx = -dx;
+      if (dx < bestDx) {
+        bestDx = dx;
+        bestW = static_cast<int>(i);
+      }
+    }
+    hlCursor.line = static_cast<uint16_t>(li);
+    hlCursor.ch = static_cast<uint16_t>(line.words[bestW].logicalStart);
+    requestUpdate();
+    return;
+  }
+  // No further non-empty line on this page in that direction: turn the page and
+  // let syncHighlightCursorToPage place the cursor on the new page.
+  highlightPageTurn(dir > 0);
+}
+
 void EpubReaderActivity::highlightPageTurn(bool forward) {
   if (!section) {
     return;
@@ -1336,11 +1468,18 @@ void EpubReaderActivity::highlightPageTurn(bool forward) {
 }
 
 void EpubReaderActivity::commitHighlight() {
-  // The anchor sits at its word's start; extend the end boundary to the end of
-  // the word under the cursor so a whole-word range is captured.
-  highlight::Pos a = hlAnchor;
-  highlight::Pos b{hlCursor.page, hlCursor.line, static_cast<uint16_t>(hlCursorWordEnd())};
-  if (highlight::posLess(b, a)) std::swap(a, b);
+  // Build a whole-word [a, b] range from the locked start word to the cursor
+  // word in either direction. Forward: start word's start -> cursor word's end.
+  // Backward (cursor before the start): cursor word's start -> start word's end,
+  // so the start word becomes the far end — matching the live preview.
+  highlight::Pos a, b;
+  if (highlight::posLess(hlCursor, hlAnchor)) {
+    a = hlCursor;
+    b = hlAnchorEnd;
+  } else {
+    a = hlAnchor;
+    b = highlight::Pos{hlCursor.page, hlCursor.line, static_cast<uint16_t>(hlCursorWordEnd())};
+  }
   if (highlight::posEqual(a, b)) {
     exitHighlightMode();  // empty selection — nothing to store
     return;
@@ -1362,7 +1501,8 @@ void EpubReaderActivity::commitHighlight() {
 
 void EpubReaderActivity::promptForHighlightComment() {
   startActivityForResult(
-      std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_ADD_COMMENT_PROMPT), ""),
+      std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_ADD_COMMENT_PROMPT), "", tr(STR_YES),
+                                             tr(STR_NO)),
       [this](const ActivityResult& confirmResult) {
         if (!confirmResult.isCancelled) {
           // User wants a comment — open the keyboard.
@@ -1558,11 +1698,18 @@ void EpubReaderActivity::drawHighlightOverlay() {
   }
 
   if (hlSelecting) {
-    // Live, in-progress selection from the (fixed) start word to the word under
-    // the moving cursor, clipped to the portion on the current page.
-    highlight::Pos a = hlAnchor;
-    highlight::Pos b{hlCursor.page, hlCursor.line, static_cast<uint16_t>(hlCursorWordEnd())};
-    if (highlight::posLess(b, a)) std::swap(a, b);
+    // Live, in-progress selection from the locked start word to the word under
+    // the moving cursor, clipped to the portion on the current page. Going
+    // backward past the start makes the start word the far end (see
+    // commitHighlight), so the preview matches what will be committed.
+    highlight::Pos a, b;
+    if (highlight::posLess(hlCursor, hlAnchor)) {
+      a = hlCursor;
+      b = hlAnchorEnd;
+    } else {
+      a = hlAnchor;
+      b = highlight::Pos{hlCursor.page, hlCursor.line, static_cast<uint16_t>(hlCursorWordEnd())};
+    }
     if (!(p < a.page || p > b.page)) {
       const int lineFrom = (p == a.page) ? a.line : 0;
       const int lineTo = (p == b.page) ? b.line : static_cast<int>(pageGeom.size()) - 1;
@@ -1758,7 +1905,8 @@ void EpubReaderActivity::addBookmarkForCurrentPage() {
 
 void EpubReaderActivity::promptForBookmarkComment() {
   startActivityForResult(
-      std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_ADD_COMMENT_PROMPT), ""),
+      std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_ADD_COMMENT_PROMPT), "", tr(STR_YES),
+                                             tr(STR_NO)),
       [this](const ActivityResult& confirmResult) {
         if (!confirmResult.isCancelled) {
           startActivityForResult(
