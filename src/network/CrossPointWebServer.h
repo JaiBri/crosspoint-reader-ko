@@ -31,7 +31,7 @@ class CrossPointWebServer {
 
   // Used by POST upload handler
   struct UploadState {
-    FsFile file;
+    HalFile file;
     String fileName;
     String path = "/";
     size_t size = 0;
@@ -107,4 +107,14 @@ class CrossPointWebServer {
   void handleSettingsPage() const;
   void handleGetSettings() const;
   void handlePostSettings();
+
+  // OPDS server handlers
+  void handleGetOpdsServers() const;
+  void handlePostOpdsServer();
+  void handleDeleteOpdsServer();
+
+  // Wi-Fi credential handlers
+  void handleGetWifiNetworks() const;
+  void handlePostWifiNetwork();
+  void handleDeleteWifiNetwork();
 };

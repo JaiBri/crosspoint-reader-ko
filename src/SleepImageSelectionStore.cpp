@@ -17,7 +17,7 @@ void SleepImageSelectionStore::loadFromFile() {
     return;
   }
 
-  FsFile file;
+  HalFile file;
   if (!Storage.openFileForRead("SIS", SLEEP_SELECTION_FILE, file)) {
     LOG_ERR("SIS", "Failed to open %s for read", SLEEP_SELECTION_FILE);
     loaded = true;
@@ -69,7 +69,7 @@ bool SleepImageSelectionStore::saveToFile() const {
     Storage.mkdir(CROSSPOINT_DIR);
   }
 
-  FsFile file;
+  HalFile file;
   if (!Storage.openFileForWrite("SIS", SLEEP_SELECTION_FILE, file)) {
     LOG_ERR("SIS", "Failed to open %s for write", SLEEP_SELECTION_FILE);
     return false;

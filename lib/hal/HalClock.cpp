@@ -100,19 +100,30 @@ bool HalClock::getTime(uint8_t& hour, uint8_t& minute) const {
   return true;
 }
 
-bool HalClock::formatTime(char* buf, size_t bufSize, uint8_t utcOffsetBiased) const {
-  if (bufSize < 6) return false;
+bool HalClock::formatTime(char* buf, size_t bufSize, uint8_t utcOffsetQuarterHoursBiased, bool use12Hour) const {
+  if (bufSize < (use12Hour ? 9u : 6u)) return false;
   uint8_t h, m;
   if (!getTime(h, m)) return false;
 
-  // Apply UTC offset: convert biased value to signed half-hours
-  int offsetHalfHours = static_cast<int>(utcOffsetBiased) - 24;
-  int totalMinutes = static_cast<int>(h) * 60 + static_cast<int>(m) + offsetHalfHours * 30;
+  // Apply UTC offset: convert biased value to signed quarter-hours.
+  // Clamp against corrupted persisted values so display time can't drift outside [-12:00, +14:00].
+  if (utcOffsetQuarterHoursBiased > 104) utcOffsetQuarterHoursBiased = 104;
+  int offsetQuarterHours = static_cast<int>(utcOffsetQuarterHoursBiased) - 48;
+  int totalMinutes = static_cast<int>(h) * 60 + static_cast<int>(m) + offsetQuarterHours * 15;
 
   // Wrap around 24 hours
   totalMinutes = ((totalMinutes % 1440) + 1440) % 1440;
 
-  snprintf(buf, bufSize, "%02d:%02d", totalMinutes / 60, totalMinutes % 60);
+  const int hour24 = totalMinutes / 60;
+  const int min = totalMinutes % 60;
+  if (use12Hour) {
+    const bool pm = hour24 >= 12;
+    int hour12 = hour24 % 12;
+    if (hour12 == 0) hour12 = 12;
+    snprintf(buf, bufSize, "%d:%02d %s", hour12, min, pm ? "PM" : "AM");
+  } else {
+    snprintf(buf, bufSize, "%02d:%02d", hour24, min);
+  }
   return true;
 }
 

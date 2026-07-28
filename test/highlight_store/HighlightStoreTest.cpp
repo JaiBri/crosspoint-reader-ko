@@ -40,6 +40,7 @@ static LayoutParams sampleLayout() {
   l.imageRendering = 2;
   l.extraParagraphSpacing = 0;
   l.paragraphIndent = 1;
+  l.focusReading = 1;
   return l;
 }
 
@@ -148,7 +149,9 @@ static void testToleranceOfProse() {
     CHECK(back[0].start.page == 11);
     CHECK(back[0].end.ch == 12);
     CHECK(back[0].text == "war is peace");
-    CHECK(back[0].layout == sampleLayout());
+    LayoutParams legacyLayout = sampleLayout();
+    legacyLayout.focusReading = 0;  // 11-field ly= predates the field
+    CHECK(back[0].layout == legacyLayout);
   }
 }
 
@@ -300,7 +303,9 @@ static void testBookmarkLegacyLineParses() {
     CHECK(back[0].page == 7);
     CHECK(back[0].pctX10000 == highlight::PCT_ABSENT);
     CHECK(back[0].text == "legacy bookmark");
-    CHECK(back[0].layout == sampleLayout());
+    LayoutParams legacyLayout = sampleLayout();
+    legacyLayout.focusReading = 0;  // 11-field ly= predates the field
+    CHECK(back[0].layout == legacyLayout);
   }
 }
 
@@ -443,6 +448,35 @@ static void testMixedFileNoCrossContamination() {
   }
 }
 
+
+// An 11-field ly= (written before focusReading joined the fingerprint) must
+// still parse, with the new field defaulting to 0. Guards the compatibility
+// that lets the fingerprint grow without a version bump.
+static void testLegacyElevenFieldLayoutParses() {
+  const std::string md =
+      "## Bookmark — Chapter 1, Page 1\n"
+      "> eleven field layout\n"
+      "<!-- cpx-bm v1 sp=0 p=0 ly=4,90,400,560,1,0,1,1,2,0,1 -->\n\n";
+  const auto back = highlight::parseBookmarks(md);
+  CHECK(back.size() == 1);
+  if (back.size() == 1) {
+    CHECK(back[0].layout.focusReading == 0);
+    CHECK(back[0].layout.paragraphIndent == 1);
+  }
+  // A 12-field ly= round-trips the new field.
+  std::vector<Highlight> none;
+  std::vector<Bookmark> bms;
+  bms.push_back(makeBm(0, 0, 5000, "twelve"));
+  const auto back12 = highlight::parseBookmarks(highlight::serialize("T", none, bms));
+  CHECK(back12.size() == 1);
+  if (back12.size() == 1) {
+    CHECK(back12[0].layout.focusReading == 1);
+    CHECK(back12[0].layout == sampleLayout());
+  }
+  // A wrong-arity ly= is still rejected outright.
+  CHECK(highlight::parseBookmarks("<!-- cpx-bm v1 sp=0 p=0 ly=4,90,400 -->\n").empty());
+}
+
 int main() {
   testRoundTrip();
   testSortByPage();
@@ -461,6 +495,7 @@ int main() {
   testPageFractionRoundTrip();
   testEncodePctClamp();
   testBookmarkSortUsesPercent();
+  testLegacyElevenFieldLayoutParses();
 
   if (g_failures == 0) {
     std::printf("HighlightStore: ALL TESTS PASSED\n");

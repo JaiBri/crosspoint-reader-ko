@@ -64,6 +64,20 @@ jobs:
           .pio/build/gh_release/firmware.map
           .pio/build/gh_release/partitions.bin
 
+    - name: Resolve release notes
+      id: notes
+      run: |
+        NOTES="docs/release-notes/${{ github.ref_name }}.md"
+        if [[ -f "$NOTES" ]]; then
+          echo "Using release notes from $NOTES"
+          echo "path=$NOTES" >> "$GITHUB_OUTPUT"
+          echo "generate=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::No release notes at $NOTES; falling back to auto-generated notes."
+          echo "path=" >> "$GITHUB_OUTPUT"
+          echo "generate=true" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Create Release with Assets
       uses: softprops/action-gh-release@v2
       with:
@@ -72,12 +86,19 @@ jobs:
           .pio/build/gh_release/firmware.bin
           .pio/build/gh_release/bootloader.bin
           .pio/build/gh_release/partitions.bin
-        generate_release_notes: false
+        body_path: ${{ steps.notes.outputs.path }}
+        generate_release_notes: ${{ steps.notes.outputs.generate }}
         draft: false
         prerelease: false
 
     - name: Trigger docs deployment
       continue-on-error: true
       run: gh workflow run deploy.yml -R crosspoint-reader-ko/crosspoint-reader-docs
+      env:
+        GH_TOKEN: ${{ secrets.CROSSPOINT_ACTION_TOKEN }}
+
+    - name: Trigger crosspoint-cloud firmware sync
+      continue-on-error: true
+      run: gh workflow run sync-version.yml -R crosspoint-reader-ko/crosspoint-cloud
       env:
         GH_TOKEN: ${{ secrets.CROSSPOINT_ACTION_TOKEN }}

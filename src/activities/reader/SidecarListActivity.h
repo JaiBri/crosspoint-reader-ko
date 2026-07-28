@@ -15,7 +15,7 @@
 // performed in the detail are applied to the owner's real vector through the
 // index-keyed onEdit/onDelete callbacks (and mirrored into this list's own row
 // copy so the display stays in sync); a Jump from the detail bubbles up to the
-// reader as a SyncResult{spine, page}.
+// reader as a ProgressChangeResult{spine, page}.
 class SidecarListActivity final : public Activity {
  public:
   struct Row {

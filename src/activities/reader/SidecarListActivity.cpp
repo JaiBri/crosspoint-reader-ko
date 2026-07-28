@@ -54,9 +54,9 @@ void SidecarListActivity::openDetail() {
             if (idx < static_cast<int>(rows.size())) rows.erase(rows.begin() + idx);
           }),
       [this](const ActivityResult& res) {
-        if (!res.isCancelled && std::holds_alternative<SyncResult>(res.data)) {
-          const auto sync = std::get<SyncResult>(res.data);
-          setResult(SyncResult{sync.spineIndex, sync.page});  // bubble the jump up to the reader
+        if (!res.isCancelled && std::holds_alternative<ProgressChangeResult>(res.data)) {
+          const auto sync = std::get<ProgressChangeResult>(res.data);
+          setResult(ProgressChangeResult{sync.spineIndex, sync.page});  // bubble the jump up to the reader
           finish();
           return;
         }

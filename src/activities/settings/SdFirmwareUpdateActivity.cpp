@@ -5,7 +5,7 @@
 #include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
-#include <Update.h>
+#include <esp_ota_ops.h>
 
 #include "MappedInputManager.h"
 #include "activities/home/FileBrowserActivity.h"
@@ -74,16 +74,23 @@ bool SdFirmwareUpdateActivity::validateFirmware() {
   firmwareSize = file.fileSize();
   file.close();
 
-  // Probe the OTA partition first so the integrity check can also enforce a fits-partition bound.
-  if (!Update.begin(firmwareSize)) {
-    LOG_ERR("FW", "Update.begin(%u) failed: %s", static_cast<unsigned>(firmwareSize), Update.errorString());
-    errorMessage = tr(STR_FIRMWARE_TOO_LARGE);
-    Update.abort();
+  // Resolve the next-update partition directly via the OTA API. Previously this
+  // probed via Update.begin(firmwareSize)/Update.abort() to learn the partition
+  // size, which had the side effect of erasing partition state and was wasted
+  // work since we only need the size bound for validation here.
+  const esp_partition_t* dest = esp_ota_get_next_update_partition(nullptr);
+  if (!dest) {
+    LOG_ERR("FW", "no next-update partition available");
+    errorMessage = tr(STR_INVALID_FIRMWARE);
     return false;
   }
-  const size_t partitionLimit = Update.size();
-  // Roll back the begin() — we'll call it again in performUpdate().
-  Update.abort();
+  const size_t partitionLimit = dest->size;
+  if (firmwareSize > partitionLimit) {
+    LOG_ERR("FW", "firmware (%u bytes) exceeds partition (%u bytes)", static_cast<unsigned>(firmwareSize),
+            static_cast<unsigned>(partitionLimit));
+    errorMessage = tr(STR_FIRMWARE_TOO_LARGE);
+    return false;
+  }
 
   // Run the same end-to-end integrity check (header / segment table / XOR checksum / SHA256
   // trailer) that the shared firmware-flasher applies right before raw-writing otadata. This
@@ -92,9 +99,13 @@ bool SdFirmwareUpdateActivity::validateFirmware() {
   const auto vr = firmware_flash::validateImageFile(firmwarePath.c_str(), partitionLimit);
   if (vr != firmware_flash::Result::OK) {
     LOG_ERR("FW", "image validation failed: %s", firmware_flash::resultName(vr));
-    errorMessage = (vr == firmware_flash::Result::TOO_SMALL || vr == firmware_flash::Result::TOO_LARGE)
-                       ? tr(STR_FIRMWARE_TOO_LARGE)
-                       : tr(STR_INVALID_FIRMWARE);
+    if (vr == firmware_flash::Result::TOO_LARGE) {
+      errorMessage = tr(STR_FIRMWARE_TOO_LARGE);
+    } else if (vr == firmware_flash::Result::TOO_SMALL) {
+      errorMessage = tr(STR_FIRMWARE_TOO_SMALL);
+    } else {
+      errorMessage = tr(STR_INVALID_FIRMWARE);
+    }
     return false;
   }
   return true;
@@ -149,6 +160,10 @@ void SdFirmwareUpdateActivity::performUpdate() {
     self->requestUpdate(true);
   };
 
+  // Re-validate at flash time (TOCTOU): SD is removable, so don't trust the
+  // pre-confirmation pass. The alreadyValidated parameter on the API stays
+  // for callers (e.g. an OTA staging path) where the same byte stream was
+  // just hashed and there's no removable-media gap.
   const auto result = firmware_flash::flashFromSdPath(firmwarePath.c_str(), progressCb, this);
   if (result != firmware_flash::Result::OK) {
     LOG_ERR("FW", "flash failed: %s", firmware_flash::resultName(result));
@@ -215,17 +230,13 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
         Rect{metrics.contentSidePadding, y, pageWidth - metrics.contentSidePadding * 2, metrics.progressBarHeight},
         static_cast<int>(pct), 100);
     y += metrics.progressBarHeight + metrics.verticalSpacing;
-    renderer.drawCenteredText(UI_10_FONT_ID, y, (std::to_string(pct) + "%").c_str());
+    // Percent label is drawn by BaseTheme::drawProgressBar; this slot is left intentionally empty
+    // so the do-not-power-off line below stays at the same Y as before.
     y += lineHeight + metrics.verticalSpacing;
     renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_FIRMWARE_UPDATE_DO_NOT_POWER_OFF));
   } else if (state == State::SUCCESS) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_UPDATE_COMPLETE), true, EpdFontFamily::BOLD);
-    int hintY = top + lineHeight + metrics.verticalSpacing;
-    renderer.drawCenteredText(UI_10_FONT_ID, hintY, tr(STR_RESTARTING_HINT));
-    hintY += lineHeight;
-    renderer.drawCenteredText(UI_10_FONT_ID, hintY, tr(STR_RESTARTING_HINT_LINE2));
-    hintY += lineHeight;
-    renderer.drawCenteredText(UI_10_FONT_ID, hintY, tr(STR_RESTARTING_HINT_LINE3));
+    renderer.drawCenteredText(UI_10_FONT_ID, top + lineHeight + metrics.verticalSpacing, tr(STR_RESTARTING_HINT));
   } else if (state == State::FAILED) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_UPDATE_FAILED), true, EpdFontFamily::BOLD);
     if (!errorMessage.empty()) {

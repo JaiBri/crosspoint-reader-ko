@@ -65,16 +65,18 @@ std::string serializeLayout(const LayoutParams& l) {
          std::to_string(l.paragraphAlignment) + "," + std::to_string(l.characterWrap) + "," +
          std::to_string(l.hyphenationEnabled) + "," + std::to_string(l.embeddedStyle) + "," +
          std::to_string(l.imageRendering) + "," + std::to_string(l.extraParagraphSpacing) + "," +
-         std::to_string(l.paragraphIndent);
+         std::to_string(l.paragraphIndent) + "," + std::to_string(l.focusReading);
 }
 
 // Parse the 11-field `ly=` value into a LayoutParams. fontId/lineCompressionX100
 // are signed (hashed/derived); the rest are non-negative but parsed signed-tolerant.
+// Accepts 11 or 12 fields: focusReading was appended after the 11-field format
+// shipped, so older sidecars are still readable and parse it as 0.
 bool parseLayout(const std::string& val, LayoutParams& l) {
   const auto parts = splitChar(val, ',');
-  if (parts.size() != 11) return false;
-  long n[11];
-  for (int i = 0; i < 11; i++) {
+  if (parts.size() != 11 && parts.size() != 12) return false;
+  long n[12] = {0};
+  for (size_t i = 0; i < parts.size(); i++) {
     if (!parseInt(parts[i], n[i])) return false;
   }
   l.fontId = static_cast<int>(n[0]);
@@ -88,6 +90,7 @@ bool parseLayout(const std::string& val, LayoutParams& l) {
   l.imageRendering = static_cast<uint8_t>(n[8]);
   l.extraParagraphSpacing = static_cast<uint8_t>(n[9]);
   l.paragraphIndent = static_cast<uint8_t>(n[10]);
+  l.focusReading = static_cast<uint8_t>(n[11]);
   return true;
 }
 

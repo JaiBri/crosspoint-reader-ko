@@ -12,19 +12,18 @@
 #include <HalStorage.h>
 #include <HalTiltSensor.h>
 #include <I18n.h>
+#include <SdFont.h>
+
+#include <algorithm>
 
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
+#include "ReaderUtils.h"
 #include "RecentBooksStore.h"
 #include "XtcReaderChapterSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
-
-namespace {
-constexpr unsigned long skipPageMs = 700;
-constexpr unsigned long goHomeMs = 1000;
-}  // namespace
 
 void XtcReaderActivity::onEnter() {
   Activity::onEnter();
@@ -34,6 +33,15 @@ void XtcReaderActivity::onEnter() {
   }
 
   xtc->setupCacheDir();
+
+  // Free the shared SD-font glyph bitmap cache before rendering. Each XTC page
+  // needs a single large contiguous buffer (up to ~96KB for XTH 2-bit, ~48KB for
+  // XTG 1-bit). A CJK system/reader SD font fills the 32KB shared glyph cache
+  // with many small mallocs that fragment the heap and can starve that
+  // contiguous allocation in renderPage(). The XTC reader only uses the UI font
+  // for the status bar/error text, so dropping the cache here is cheap; it
+  // re-populates on demand. See renderPage() for the retry-after-clear safety net.
+  SdFontData::clearCache();
 
   // Load saved progress
   loadProgress();
@@ -70,34 +78,19 @@ void XtcReaderActivity::loop() {
   }
 
   // Long press BACK (1s+) goes to file selection
-  if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= goHomeMs) {
+  if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
     activityManager.goToFileBrowser(xtc ? xtc->getPath() : "");
     return;
   }
 
   // Short press BACK goes directly to home
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back) && mappedInput.getHeldTime() < goHomeMs) {
+  if (mappedInput.wasReleased(MappedInputManager::Button::Back) &&
+      mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
     onGoHome();
     return;
   }
 
-  // When long-press chapter skip is disabled, turn pages on press instead of release.
-  const bool usePressForPageTurn = !SETTINGS.longPressChapterSkip;
-  const bool tiltNext = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedForward();
-  const bool tiltPrev = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedBack();
-  const bool prevTriggered =
-      tiltPrev || (usePressForPageTurn ? (mappedInput.wasPressed(MappedInputManager::Button::PageBack) ||
-                                          mappedInput.wasPressed(MappedInputManager::Button::Left))
-                                       : (mappedInput.wasReleased(MappedInputManager::Button::PageBack) ||
-                                          mappedInput.wasReleased(MappedInputManager::Button::Left)));
-  const bool powerPageTurn = SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PAGE_TURN &&
-                             mappedInput.wasReleased(MappedInputManager::Button::Power);
-  const bool nextTriggered =
-      tiltNext || (usePressForPageTurn ? (mappedInput.wasPressed(MappedInputManager::Button::PageForward) ||
-                                          powerPageTurn || mappedInput.wasPressed(MappedInputManager::Button::Right))
-                                       : (mappedInput.wasReleased(MappedInputManager::Button::PageForward) ||
-                                          powerPageTurn || mappedInput.wasReleased(MappedInputManager::Button::Right)));
-
+  const auto [prevTriggered, nextTriggered, fromTilt] = ReaderUtils::detectPageTurn(mappedInput);
   if (!prevTriggered && !nextTriggered) {
     return;
   }
@@ -113,8 +106,8 @@ void XtcReaderActivity::loop() {
     return;
   }
 
-  const bool fromTilt = tiltPrev || tiltNext;
-  const bool skipPages = !fromTilt && SETTINGS.longPressChapterSkip && mappedInput.getHeldTime() > skipPageMs;
+  const bool skipPages = !fromTilt && SETTINGS.longPressButtonBehavior == SETTINGS.CHAPTER_SKIP &&
+                         mappedInput.getHeldTime() > ReaderUtils::SKIP_HOLD_MS;
   const int skipAmount = skipPages ? 10 : 1;
 
   if (prevTriggered) {
@@ -151,23 +144,101 @@ void XtcReaderActivity::render(RenderLock&&) {
   saveProgress();
 }
 
+XtcReaderActivity::StatusBarInfo XtcReaderActivity::getStatusBarInfo() const {
+  const int bookPageCount = static_cast<int>(xtc->getPageCount());
+  const int bookPage = static_cast<int>(currentPage) + 1;
+  std::string title =
+      SETTINGS.statusBarTitle == CrossPointSettings::STATUS_BAR_TITLE::BOOK_TITLE ? xtc->getTitle() : "";
+
+  if (!xtc->hasChapters()) {
+    return StatusBarInfo{bookPage, bookPageCount, std::move(title)};
+  }
+
+  const auto& chapters = xtc->getChapters();
+  const auto chapterIt = std::find_if(chapters.begin(), chapters.end(), [this](const xtc::ChapterInfo& chapter) {
+    return currentPage >= chapter.startPage && currentPage <= chapter.endPage;
+  });
+
+  if (chapterIt == chapters.end() || chapterIt->endPage < chapterIt->startPage) {
+    return StatusBarInfo{bookPage, bookPageCount, std::move(title)};
+  }
+
+  if (SETTINGS.statusBarTitle == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE) {
+    title = chapterIt->name.empty() ? tr(STR_UNNAMED) : chapterIt->name;
+  }
+
+  return StatusBarInfo{static_cast<int>(currentPage - chapterIt->startPage) + 1,
+                       static_cast<int>(chapterIt->endPage - chapterIt->startPage) + 1, std::move(title)};
+}
+
+void XtcReaderActivity::renderStatusBarOverlay(const StatusBarOverlayPosition position) const {
+  const bool drawBottom = SETTINGS.xtcStatusBarMode == CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_BOTTOM &&
+                          position == StatusBarOverlayPosition::Bottom;
+  const bool drawTop = SETTINGS.xtcStatusBarMode == CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_TOP &&
+                       position == StatusBarOverlayPosition::Top;
+  if (!drawBottom && !drawTop) {
+    return;
+  }
+
+  const int statusBarHeight = UITheme::getInstance().getStatusBarHeight();
+  if (statusBarHeight <= 0) {
+    return;
+  }
+
+  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
+  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
+                                   &orientedMarginLeft);
+
+  int clearY;
+  int paddingBottom = 0;
+  if (position == StatusBarOverlayPosition::Bottom) {
+    clearY = renderer.getScreenHeight() - orientedMarginBottom - statusBarHeight - 4;
+    if (clearY < 0) {
+      clearY = 0;
+    }
+  } else {
+    clearY = orientedMarginTop;
+    paddingBottom = renderer.getScreenHeight() - statusBarHeight - orientedMarginBottom - orientedMarginTop - 4;
+  }
+  const int clearHeight = position == StatusBarOverlayPosition::Bottom
+                              ? renderer.getScreenHeight() - orientedMarginBottom - clearY
+                              : statusBarHeight + 4;
+  if (clearHeight > 0) {
+    renderer.fillRect(0, clearY, renderer.getScreenWidth(), clearHeight, false);
+  }
+
+  const int pageCount = static_cast<int>(xtc->getPageCount());
+  const int displayPage = static_cast<int>(currentPage) + 1;
+  const float progress = pageCount > 0 ? (static_cast<float>(displayPage) * 100.0f) / pageCount : 0.0f;
+  const auto pageInfo = getStatusBarInfo();
+  GUI.drawStatusBar(renderer, progress, pageInfo.currentPage, pageInfo.pageCount, pageInfo.title, paddingBottom);
+}
+
 void XtcReaderActivity::renderPage() {
   const uint16_t pageWidth = xtc->getPageWidth();
   const uint16_t pageHeight = xtc->getPageHeight();
   const uint8_t bitDepth = xtc->getBitDepth();
 
-  // Calculate buffer size for one page
-  // XTG (1-bit): Row-major, ((width+7)/8) * height bytes
-  // XTH (2-bit): Two bit planes, column-major, ((width * height + 7) / 8) * 2 bytes
-  size_t pageBufferSize;
-  if (bitDepth == 2) {
-    pageBufferSize = ((static_cast<size_t>(pageWidth) * pageHeight + 7) / 8) * 2;
-  } else {
-    pageBufferSize = ((pageWidth + 7) / 8) * pageHeight;
+  // XTG 1-bit pages are streamed (see below) and need no large buffer. Only the
+  // XTH 2-bit grayscale path buffers the whole page, because its two bit planes
+  // are accessed in column-major random order across the full image.
+  if (bitDepth != 2) {
+    renderStreaming1Bit(pageWidth, pageHeight);
+    return;
   }
+
+  // XTH (2-bit): two bit planes, column-major. ((width * height + 7) / 8) * 2 bytes.
+  const size_t pageBufferSize = ((static_cast<size_t>(pageWidth) * pageHeight + 7) / 8) * 2;
 
   // Allocate page buffer
   uint8_t* pageBuffer = static_cast<uint8_t*>(malloc(pageBufferSize));
+  if (!pageBuffer) {
+    // Heap is likely fragmented by the SD-font glyph cache (no single contiguous
+    // block this large despite enough total free heap). Drop the cache and retry
+    // once before giving up.
+    SdFontData::clearCache();
+    pageBuffer = static_cast<uint8_t*>(malloc(pageBufferSize));
+  }
   if (!pageBuffer) {
     LOG_ERR("XTR", "Failed to allocate page buffer (%lu bytes)", pageBufferSize);
     renderer.clearScreen();
@@ -179,7 +250,8 @@ void XtcReaderActivity::renderPage() {
   // Load page data
   size_t bytesRead = xtc->loadPage(currentPage, pageBuffer, pageBufferSize);
   if (bytesRead == 0) {
-    LOG_ERR("XTR", "Failed to load page %lu", currentPage);
+    LOG_ERR("XTR", "Failed to load page %lu: bufferSize=%lu bitDepth=%u error=%s", currentPage, pageBufferSize,
+            bitDepth, xtc::errorToString(xtc->getLastError()));
     free(pageBuffer);
     renderer.clearScreen();
     renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
@@ -190,11 +262,7 @@ void XtcReaderActivity::renderPage() {
   // Clear screen first
   renderer.clearScreen();
 
-  // Copy page bitmap using GfxRenderer's drawPixel
-  // XTC/XTCH pages are pre-rendered with status bar included, so render full page
-  const uint16_t maxSrcY = pageHeight;
-
-  if (bitDepth == 2) {
+  {
     // XTH 2-bit mode: Two bit planes, column-major order
     // - Columns scanned right to left (x = width-1 down to 0)
     // - 8 vertical pixels per byte (MSB = topmost pixel in group)
@@ -240,14 +308,7 @@ void XtcReaderActivity::renderPage() {
       }
     }
 
-    // Display BW with conditional refresh based on pagesUntilFullRefresh
-    if (pagesUntilFullRefresh <= 1) {
-      renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-      pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
-    } else {
-      renderer.displayBuffer();
-      pagesUntilFullRefresh--;
-    }
+    ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
 
     // Pass 2: LSB buffer - mark DARK gray only (XTH value 1)
     // In LUT: 0 bit = apply gray effect, 1 bit = untouched
@@ -294,45 +355,66 @@ void XtcReaderActivity::renderPage() {
 
     LOG_DBG("XTR", "Rendered page %lu/%lu (2-bit grayscale)", currentPage + 1, xtc->getPageCount());
     return;
-  } else {
-    // 1-bit mode: 8 pixels per byte, MSB first
-    const size_t srcRowBytes = (pageWidth + 7) / 8;  // 60 bytes for 480 width
+  }
+}
 
-    for (uint16_t srcY = 0; srcY < maxSrcY; srcY++) {
-      const size_t srcRowStart = srcY * srcRowBytes;
+void XtcReaderActivity::renderStreaming1Bit(uint16_t pageWidth, uint16_t pageHeight) {
+  // XTG 1-bit: row-major, 8 pixels per byte, MSB first. Stream the page in
+  // row-aligned bands straight into the framebuffer, so no large contiguous page
+  // buffer is allocated. This keeps XTC rendering independent of heap
+  // fragmentation from SD fonts, which previously starved the ~48KB page-buffer
+  // malloc and produced STR_MEMORY_ERROR.
+  renderer.clearScreen();
 
-      for (uint16_t srcX = 0; srcX < pageWidth; srcX++) {
-        // Read source pixel (MSB first, bit 7 = leftmost pixel)
-        const size_t srcByte = srcRowStart + srcX / 8;
-        const size_t srcBit = 7 - (srcX % 8);
-        const bool isBlack = !((pageBuffer[srcByte] >> srcBit) & 1);  // XTC: 0 = black, 1 = white
+  const size_t srcRowBytes = (pageWidth + 7) / 8;  // 60 bytes for 480 width
+  static constexpr uint16_t STREAM_BAND_ROWS = 16;
 
-        if (isBlack) {
-          renderer.drawPixel(srcX, srcY, true);
+  const xtc::XtcError streamErr = xtc->loadPageStreaming(
+      currentPage,
+      [&](const uint8_t* data, size_t size, size_t offset) {
+        // chunkSize is a multiple of srcRowBytes, so each band is whole rows.
+        const uint16_t startRow = static_cast<uint16_t>(offset / srcRowBytes);
+        const uint16_t bandRows = static_cast<uint16_t>(size / srcRowBytes);
+        for (uint16_t r = 0; r < bandRows; r++) {
+          const uint16_t srcY = startRow + r;
+          if (srcY >= pageHeight) {
+            return;
+          }
+          const size_t rowStart = static_cast<size_t>(r) * srcRowBytes;
+          for (uint16_t srcX = 0; srcX < pageWidth; srcX++) {
+            const size_t srcByte = rowStart + srcX / 8;
+            const size_t srcBit = 7 - (srcX % 8);
+            const bool isBlack = !((data[srcByte] >> srcBit) & 1);  // XTC: 0 = black, 1 = white
+            if (isBlack) {
+              renderer.drawPixel(srcX, srcY, true);
+            }
+          }
         }
-      }
-    }
-  }
-  // White pixels are already cleared by clearScreen()
+      },
+      srcRowBytes * STREAM_BAND_ROWS);
 
-  free(pageBuffer);
-
-  // XTC pages already have status bar pre-rendered, no need to add our own
-
-  // Display with appropriate refresh
-  if (pagesUntilFullRefresh <= 1) {
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-    pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
-  } else {
+  if (streamErr != xtc::XtcError::OK) {
+    LOG_ERR("XTR", "Failed to stream page %lu: %s", currentPage, xtc::errorToString(streamErr));
+    renderer.clearScreen();
+    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
     renderer.displayBuffer();
-    pagesUntilFullRefresh--;
+    return;
   }
 
-  LOG_DBG("XTR", "Rendered page %lu/%lu (%u-bit)", currentPage + 1, xtc->getPageCount(), bitDepth);
+  // White pixels are already cleared by clearScreen()
+  if (SETTINGS.xtcStatusBarMode == CrossPointSettings::XTC_STATUS_BAR_MODE::XTC_STATUS_BAR_TOP) {
+    renderStatusBarOverlay(StatusBarOverlayPosition::Top);
+  } else {
+    renderStatusBarOverlay(StatusBarOverlayPosition::Bottom);
+  }
+
+  ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+
+  LOG_DBG("XTR", "Rendered page %lu/%lu (1-bit streamed)", currentPage + 1, xtc->getPageCount());
 }
 
 void XtcReaderActivity::saveProgress() const {
-  FsFile f;
+  HalFile f;
   if (Storage.openFileForWrite("XTR", xtc->getCachePath() + "/progress.bin", f)) {
     uint8_t data[4];
     data[0] = currentPage & 0xFF;
@@ -345,7 +427,7 @@ void XtcReaderActivity::saveProgress() const {
 }
 
 void XtcReaderActivity::loadProgress() {
-  FsFile f;
+  HalFile f;
   if (Storage.openFileForRead("XTR", xtc->getCachePath() + "/progress.bin", f)) {
     uint8_t data[4];
     if (f.read(data, 4) == 4) {
@@ -359,4 +441,22 @@ void XtcReaderActivity::loadProgress() {
     }
     f.close();
   }
+}
+
+ScreenshotInfo XtcReaderActivity::getScreenshotInfo() const {
+  ScreenshotInfo info;
+  info.readerType = ScreenshotInfo::ReaderType::Xtc;
+  if (xtc) {
+    const std::string t = xtc->getTitle();
+    snprintf(info.title, sizeof(info.title), "%s", t.c_str());
+    const uint32_t pageCount = xtc->getPageCount();
+    info.totalPages = pageCount;
+    // Clamp to last valid page to avoid sentinel value (currentPage == pageCount)
+    uint32_t clampedPage = (pageCount > 0 && currentPage >= pageCount) ? pageCount - 1 : currentPage;
+    info.progressPercent = pageCount > 0 ? xtc->calculateProgress(clampedPage) : 0;
+    info.currentPage = static_cast<int>(clampedPage) + 1;
+  } else {
+    info.currentPage = currentPage + 1;
+  }
+  return info;
 }

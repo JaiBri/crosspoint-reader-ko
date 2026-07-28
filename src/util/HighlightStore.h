@@ -45,6 +45,10 @@ struct LayoutParams {
   uint8_t imageRendering = 0;
   uint8_t extraParagraphSpacing = 0;
   uint8_t paragraphIndent = 0;
+  // Focus Reading changes line breaking, so it changes pagination and therefore
+  // belongs in the fingerprint. Added after the 11-field format shipped; files
+  // written before it parse with 0, which matches the default-off setting.
+  uint8_t focusReading = 0;
 
   bool operator==(const LayoutParams&) const = default;
 };

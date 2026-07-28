@@ -19,14 +19,14 @@ constexpr const char* CACHE_DIR = "/.crosspoint/cache";
 
 // Recursively delete a directory and its contents
 void deleteDirectory(const char* path) {
-  FsFile dir = Storage.open(path);
+  HalFile dir = Storage.open(path);
   if (!dir || !dir.isDirectory()) {
     if (dir) dir.close();
     return;
   }
 
   while (true) {
-    FsFile entry = dir.openNextFile();
+    HalFile entry = dir.openNextFile();
     if (!entry) break;
     char entryName[64];
     entry.getName(entryName, sizeof(entryName));
@@ -49,7 +49,7 @@ void deleteDirectory(const char* path) {
 void invalidateReaderCaches() {
   LOG_DBG("FNT", "Invalidating reader rendering caches...");
 
-  FsFile cacheDir = Storage.open(CACHE_DIR);
+  HalFile cacheDir = Storage.open(CACHE_DIR);
   if (!cacheDir || !cacheDir.isDirectory()) {
     if (cacheDir) cacheDir.close();
     LOG_DBG("FNT", "No cache directory found");
@@ -58,7 +58,7 @@ void invalidateReaderCaches() {
 
   int deletedCount = 0;
   while (true) {
-    FsFile bookCache = cacheDir.openNextFile();
+    HalFile bookCache = cacheDir.openNextFile();
     if (!bookCache) break;
     char bookCacheName[64];
     bookCache.getName(bookCacheName, sizeof(bookCacheName));
@@ -68,7 +68,7 @@ void invalidateReaderCaches() {
 
     // For EPUB: delete sections/ folder (keeps progress.bin)
     std::string sectionsPath = bookCachePath + "/sections";
-    FsFile sectionsDir = Storage.open(sectionsPath.c_str());
+    HalFile sectionsDir = Storage.open(sectionsPath.c_str());
     if (sectionsDir && sectionsDir.isDirectory()) {
       sectionsDir.close();
       deleteDirectory(sectionsPath.c_str());
@@ -97,8 +97,8 @@ void FontSelectionActivity::taskTrampoline(void* param) {
   self->displayTaskLoop();
 }
 
-void FontSelectionActivity::scanFontsInDirectory(const char* dirPath) {
-  FsFile dir = Storage.open(dirPath);
+void FontSelectionActivity::scanFontsInDirectory(const char* dirPath, bool recurseIntoSubdirs) {
+  HalFile dir = Storage.open(dirPath);
   if (!dir) {
     LOG_DBG("FNT", "Font folder %s not found", dirPath);
     return;
@@ -110,29 +110,34 @@ void FontSelectionActivity::scanFontsInDirectory(const char* dirPath) {
     return;
   }
 
-  // List all .epdfont files
+  // Scan for .epdfont files here, and one level into family subfolders. The per-family
+  // layout places each file at /fonts/<Family>/<Family>_<size>.epdfont, so we must look
+  // inside per-family subfolders; flat files directly in dirPath are also accepted.
   while (true) {
-    FsFile file = dir.openNextFile();
+    HalFile file = dir.openNextFile();
     if (!file) break;
-    if (!file.isDirectory()) {
-      char filename[64];
-      file.getName(filename, sizeof(filename));
+    char name[64];
+    file.getName(name, sizeof(name));
+    const bool isDir = file.isDirectory();
+    file.close();  // close before recursing/continuing (serialize SD handle use)
 
-      // Check if file has .epdfont extension and skip macOS hidden files (._*)
-      const size_t len = strlen(filename);
-      if (len > 8 && strcasecmp(filename + len - 8, ".epdfont") == 0 && strncmp(filename, "._", 2) != 0) {
-        // Build full path
-        std::string fullPath = std::string(dirPath) + "/" + filename;
-        fontFiles.push_back(fullPath);
-
-        // Extract name without extension for display
-        std::string displayName(filename, len - 8);
-        fontNames.push_back(displayName);
-
-        LOG_DBG("FNT", "Found font: %s", fullPath.c_str());
+    if (isDir) {
+      // Recurse exactly one level into a family subfolder. Skip hidden/system entries.
+      if (recurseIntoSubdirs && name[0] != '.' && strncmp(name, "._", 2) != 0) {
+        std::string subPath = std::string(dirPath) + "/" + name;
+        scanFontsInDirectory(subPath.c_str(), false);
       }
+      continue;
     }
-    file.close();
+
+    // Accept .epdfont files (the format SdFont::load reads); skip macOS hidden files (._*)
+    const size_t len = strlen(name);
+    if (len > 8 && strcasecmp(name + len - 8, ".epdfont") == 0 && strncmp(name, "._", 2) != 0) {
+      std::string fullPath = std::string(dirPath) + "/" + name;
+      fontFiles.push_back(fullPath);
+      fontNames.push_back(std::string(name, len - 8));  // display name without extension
+      LOG_DBG("FNT", "Found font: %s", fullPath.c_str());
+    }
   }
   dir.close();
 }
@@ -141,27 +146,31 @@ void FontSelectionActivity::loadFontList() {
   fontFiles.clear();
   fontNames.clear();
 
-  // First entry is always the default font (empty path means default)
+  // First entry is always the default font (empty path means default).
+  // Reader default is KoPub Batang; UI system-font default is Pretendard.
   fontFiles.emplace_back("");
-  fontNames.emplace_back(DEFAULT_FONT_NAME);
+  fontNames.emplace_back(isSystemTarget() ? "Pretendard (기본)" : DEFAULT_FONT_NAME);
 
   // Ensure fonts directory exists
   Storage.mkdir("/.crosspoint");
   Storage.mkdir(FONTS_DIR);
 
-  // Scan fonts from /.crosspoint/fonts
+  // Scan /.crosspoint/fonts, the visible /fonts root, and the hidden /.fonts root.
+  // Each scan also descends one level into per-family subfolders (the layout:
+  // /fonts/<Family>/<Family>_<size>.epdfont, or /.fonts/<Family>/... when hidden).
   scanFontsInDirectory(FONTS_DIR);
-
-  // Also scan fonts from /fonts (root folder)
   scanFontsInDirectory(ROOT_FONTS_DIR);
+  scanFontsInDirectory(HIDDEN_FONTS_DIR);
 
   LOG_DBG("FNT", "Total fonts found: %zu (including default)", fontFiles.size());
 
   // Find currently selected font index
   selectedIndex = 0;  // Default
-  if (SETTINGS.hasCustomFont()) {
+  const bool hasCurrent = isSystemTarget() ? SETTINGS.hasSystemFont() : SETTINGS.hasCustomFont();
+  const char* currentPath = isSystemTarget() ? SETTINGS.systemFontPath : SETTINGS.customFontPath;
+  if (hasCurrent) {
     for (size_t i = 1; i < fontFiles.size(); i++) {
-      if (fontFiles[i] == SETTINGS.customFontPath) {
+      if (fontFiles[i] == currentPath) {
         selectedIndex = static_cast<int>(i);
         break;
       }
@@ -235,24 +244,31 @@ void FontSelectionActivity::handleSelection() {
   renderer.drawCenteredText(UI_10_FONT_ID, renderer.getScreenHeight() / 2 - 10, "글꼴 적용 중...");
   renderer.displayBuffer();
 
-  // Update custom font path in settings
+  // Update the target font path in settings
+  char* destPath = isSystemTarget() ? SETTINGS.systemFontPath : SETTINGS.customFontPath;
+  const size_t destSize = isSystemTarget() ? sizeof(SETTINGS.systemFontPath) : sizeof(SETTINGS.customFontPath);
   if (selectedIndex == 0) {
-    // Default font selected - clear custom font path
-    SETTINGS.customFontPath[0] = '\0';
+    // Default selected - clear the path
+    destPath[0] = '\0';
   } else {
-    // Custom font selected
-    strncpy(SETTINGS.customFontPath, fontFiles[selectedIndex].c_str(), sizeof(SETTINGS.customFontPath) - 1);
-    SETTINGS.customFontPath[sizeof(SETTINGS.customFontPath) - 1] = '\0';
+    strncpy(destPath, fontFiles[selectedIndex].c_str(), destSize - 1);
+    destPath[destSize - 1] = '\0';
   }
 
   SETTINGS.saveToFile();
-  LOG_DBG("FNT", "Font selected: %s", selectedIndex == 0 ? "default" : SETTINGS.customFontPath);
+  LOG_DBG("FNT", "Font selected (%s): %s", isSystemTarget() ? "system" : "reader",
+          selectedIndex == 0 ? "default" : destPath);
 
-  // Reload custom font dynamically (no reboot needed)
-  reloadCustomReaderFont();
-
-  // Invalidate EPUB/TXT caches since font changed
-  invalidateReaderCaches();
+  if (isSystemTarget()) {
+    // Reload UI system font dynamically (no reboot needed). UI-only, so reader caches
+    // are unaffected and must NOT be invalidated.
+    reloadSystemFont();
+  } else {
+    // Reload custom reader font dynamically (no reboot needed)
+    reloadCustomReaderFont();
+    // Invalidate EPUB/TXT caches since the reader font changed
+    invalidateReaderCaches();
+  }
 
   xSemaphoreGive(displayMutex);
 
@@ -279,7 +295,8 @@ void FontSelectionActivity::render() {
   const auto pageHeight = renderer.getScreenHeight();
 
   // Draw header
-  renderer.drawCenteredText(UI_12_FONT_ID, 15, "글꼴 선택", true, EpdFontFamily::BOLD);
+  renderer.drawCenteredText(UI_12_FONT_ID, 15, isSystemTarget() ? "시스템 글꼴 선택" : "글꼴 선택", true,
+                            EpdFontFamily::BOLD);
 
   // Calculate visible items (with scrolling if needed)
   constexpr int lineHeight = 30;
@@ -297,9 +314,11 @@ void FontSelectionActivity::render() {
 
   // Determine current selection (for checkmark comparison)
   int currentSelectedIndex = 0;  // Default
-  if (SETTINGS.hasCustomFont()) {
+  const bool hasCurrent = isSystemTarget() ? SETTINGS.hasSystemFont() : SETTINGS.hasCustomFont();
+  const char* currentPath = isSystemTarget() ? SETTINGS.systemFontPath : SETTINGS.customFontPath;
+  if (hasCurrent) {
     for (size_t i = 1; i < fontFiles.size(); i++) {
-      if (fontFiles[i] == SETTINGS.customFontPath) {
+      if (fontFiles[i] == currentPath) {
         currentSelectedIndex = static_cast<int>(i);
         break;
       }

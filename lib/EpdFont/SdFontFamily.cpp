@@ -1,6 +1,9 @@
 #include "SdFontFamily.h"
 
-#include <HardwareSerial.h>
+#include <Logging.h>
+#include <Utf8.h>
+
+#include <algorithm>
 
 // ============================================================================
 // SdFontFamily Implementation
@@ -73,19 +76,19 @@ bool SdFontFamily::load() {
   bool success = true;
 
   if (regular && !regular->load()) {
-    Serial.printf("[%lu] [SdFontFamily] Failed to load regular font\n", millis());
+    LOG_ERR("SDF", "Failed to load regular font");
     success = false;
   }
   if (bold && !bold->load()) {
-    Serial.printf("[%lu] [SdFontFamily] Failed to load bold font\n", millis());
+    LOG_ERR("SDF", "Failed to load bold font");
     // Bold is optional, don't fail completely
   }
   if (italic && !italic->load()) {
-    Serial.printf("[%lu] [SdFontFamily] Failed to load italic font\n", millis());
+    LOG_ERR("SDF", "Failed to load italic font");
     // Italic is optional
   }
   if (boldItalic && !boldItalic->load()) {
-    Serial.printf("[%lu] [SdFontFamily] Failed to load bold-italic font\n", millis());
+    LOG_ERR("SDF", "Failed to load bold-italic font");
     // Bold-italic is optional
   }
 
@@ -136,6 +139,11 @@ const EpdGlyph* SdFontFamily::getGlyph(uint32_t cp, EpdFontStyle style) const {
   return font ? font->getGlyph(cp) : nullptr;
 }
 
+bool SdFontFamily::hasGlyph(uint32_t cp, EpdFontStyle style) const {
+  SdFont* font = getFont(style);
+  return font ? font->hasGlyph(cp) : false;
+}
+
 const uint8_t* SdFontFamily::getGlyphBitmap(uint32_t cp, EpdFontStyle style) const {
   SdFont* font = getFont(style);
   return font ? font->getGlyphBitmap(cp) : nullptr;
@@ -175,9 +183,10 @@ UnifiedFontFamily::~UnifiedFontFamily() {
 }
 
 UnifiedFontFamily::UnifiedFontFamily(UnifiedFontFamily&& other) noexcept
-    : type(other.type), flashFont(other.flashFont), sdFont(other.sdFont) {
+    : type(other.type), flashFont(other.flashFont), sdFont(other.sdFont), glyphFallback(other.glyphFallback) {
   other.flashFont = nullptr;
   other.sdFont = nullptr;
+  other.glyphFallback = nullptr;
 }
 
 UnifiedFontFamily& UnifiedFontFamily::operator=(UnifiedFontFamily&& other) noexcept {
@@ -188,40 +197,169 @@ UnifiedFontFamily& UnifiedFontFamily::operator=(UnifiedFontFamily&& other) noexc
     type = other.type;
     flashFont = other.flashFont;
     sdFont = other.sdFont;
+    glyphFallback = other.glyphFallback;
 
     other.flashFont = nullptr;
     other.sdFont = nullptr;
+    other.glyphFallback = nullptr;
   }
   return *this;
 }
 
 void UnifiedFontFamily::getTextDimensions(const char* string, int* w, int* h, EpdFontStyle style) const {
-  if (type == Type::FLASH && flashFont) {
-    flashFont->getTextDimensions(string, w, h, style);
-  } else if (sdFont) {
-    sdFont->getTextDimensions(string, w, h, style);
-  } else {
-    *w = 0;
-    *h = 0;
+  // Fast path: with no glyph-level fallback configured, behaviour is identical to before —
+  // delegate straight to the underlying family so all existing layout is byte-for-byte unchanged.
+  if (!glyphFallback) {
+    if (type == Type::FLASH && flashFont) {
+      flashFont->getTextDimensions(string, w, h, style);
+    } else if (sdFont) {
+      sdFont->getTextDimensions(string, w, h, style);
+    } else {
+      *w = 0;
+      *h = 0;
+    }
+    return;
   }
+
+  // Fallback-aware bounds: mirror EpdFont::getTextBounds exactly (same ligatures, kerning,
+  // combining-mark handling and 12.4 fixed-point snapping) but resolve each glyph through
+  // familyForGlyph so fallback glyphs contribute their real metrics. This keeps getTextWidth()
+  // in agreement with drawText() for mixed Hangul/Hanja strings.
+  *w = 0;
+  *h = 0;
+  if (!string || *string == '\0') {
+    return;
+  }
+
+  int minX = 0, minY = 0, maxX = 0, maxY = 0;
+  int lastBaseX = 0, lastBaseLeft = 0, lastBaseWidth = 0, lastBaseTop = 0;
+  int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
+  const char* cursor = string;
+  uint32_t cp;
+  uint32_t prevCp = 0;
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&cursor)))) {
+    const bool isCombining = utf8IsCombiningMark(cp);
+    if (!isCombining) {
+      cp = applyLigatures(cp, cursor, style);  // ligatures come from the primary flash font
+    }
+
+    const EpdGlyph* glyph = nullptr;
+    familyForGlyph(cp, style, &glyph);
+    if (!glyph) {
+      if (!isCombining) {
+        lastBaseX += fp4::toPixel(prevAdvanceFP);  // flush pending advance before resetting
+        prevCp = 0;
+        prevAdvanceFP = 0;
+        lastBaseLeft = 0;
+        lastBaseWidth = 0;
+        lastBaseTop = 0;
+      }
+      continue;
+    }
+
+    const int raiseBy = isCombining ? combiningMark::raiseAboveBase(glyph->top, glyph->height, lastBaseTop) : 0;
+
+    if (!isCombining && prevCp != 0) {
+      const auto kernFP = getKerning(prevCp, cp, style);  // 4.4 fixed-point kern (primary only)
+      lastBaseX += fp4::toPixel(prevAdvanceFP + kernFP);
+    }
+
+    const int glyphBaseX =
+        isCombining ? combiningMark::centerOver(lastBaseX, lastBaseLeft, lastBaseWidth, glyph->left, glyph->width)
+                    : lastBaseX;
+    const int glyphBaseY = 0 - raiseBy;
+
+    minX = std::min(minX, glyphBaseX + glyph->left);
+    maxX = std::max(maxX, glyphBaseX + glyph->left + glyph->width);
+    minY = std::min(minY, glyphBaseY + glyph->top - glyph->height);
+    maxY = std::max(maxY, glyphBaseY + glyph->top);
+
+    if (!isCombining) {
+      lastBaseLeft = glyph->left;
+      lastBaseWidth = glyph->width;
+      lastBaseTop = glyph->top;
+      prevAdvanceFP = glyph->advanceX;  // 12.4 fixed-point
+      prevCp = cp;
+    }
+  }
+
+  *w = maxX - minX;
+  *h = maxY - minY;
 }
 
 bool UnifiedFontFamily::hasPrintableChars(const char* string, EpdFontStyle style) const {
-  if (type == Type::FLASH && flashFont) {
-    return flashFont->hasPrintableChars(string, style);
-  } else if (sdFont) {
-    return sdFont->hasPrintableChars(string, style);
+  const bool primaryHas = (type == Type::FLASH && flashFont) ? flashFont->hasPrintableChars(string, style)
+                          : (sdFont)                         ? sdFont->hasPrintableChars(string, style)
+                                                             : false;
+  if (primaryHas) {
+    return true;
+  }
+  // A string consisting only of glyphs absent from the primary (e.g. an all-Hanja
+  // title under the Hangul/Latin UI font) is still printable via the fallback.
+  if (glyphFallback && string) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(string);
+    uint32_t cp;
+    while ((cp = utf8NextCodepoint(&p))) {
+      if (glyphFallback->hasOwnGlyph(cp, style)) {
+        return true;
+      }
+    }
   }
   return false;
 }
 
-const EpdGlyph* UnifiedFontFamily::getGlyph(uint32_t cp, EpdFontStyle style) const {
+bool UnifiedFontFamily::hasOwnGlyph(uint32_t cp, EpdFontStyle style) const {
+  if (type == Type::FLASH && flashFont) {
+    return flashFont->hasGlyph(cp, style);
+  } else if (sdFont) {
+    return sdFont->hasGlyph(cp, style);
+  }
+  return false;
+}
+
+const EpdGlyph* UnifiedFontFamily::getOwnGlyph(uint32_t cp, EpdFontStyle style) const {
   if (type == Type::FLASH && flashFont) {
     return flashFont->getGlyph(cp, style);
   } else if (sdFont) {
     return sdFont->getGlyph(cp, style);
   }
   return nullptr;
+}
+
+const UnifiedFontFamily* UnifiedFontFamily::familyForGlyph(uint32_t cp, EpdFontStyle style,
+                                                           const EpdGlyph** outGlyph) const {
+  // Fast path (the common case, incl. the reader body font): no fallback configured, so a
+  // single glyph lookup is all that is needed — identical cost to the pre-fallback renderer.
+  if (!glyphFallback) {
+    *outGlyph = getOwnGlyph(cp, style);
+    return this;
+  }
+  if (hasOwnGlyph(cp, style)) {
+    *outGlyph = getOwnGlyph(cp, style);
+    return this;
+  }
+  if (glyphFallback->hasOwnGlyph(cp, style)) {
+    *outGlyph = glyphFallback->getOwnGlyph(cp, style);
+    return glyphFallback;
+  }
+  // Neither has it: fall back to the primary's own lookup (flash replacement glyph
+  // or nullptr for SD), preserving the pre-fallback rendering behavior.
+  *outGlyph = getOwnGlyph(cp, style);
+  return this;
+}
+
+const EpdGlyph* UnifiedFontFamily::getGlyph(uint32_t cp, EpdFontStyle style) const {
+  // Fast path: no fallback → single lookup, byte-for-byte identical to the original behavior.
+  if (!glyphFallback) {
+    return getOwnGlyph(cp, style);
+  }
+  if (hasOwnGlyph(cp, style)) {
+    return getOwnGlyph(cp, style);
+  }
+  if (glyphFallback->hasOwnGlyph(cp, style)) {
+    return glyphFallback->getOwnGlyph(cp, style);
+  }
+  return getOwnGlyph(cp, style);
 }
 
 const uint8_t* UnifiedFontFamily::getGlyphBitmap(uint32_t cp, EpdFontStyle style) const {

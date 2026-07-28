@@ -1,6 +1,5 @@
 #pragma once
 
-#include <functional>
 #include <string>
 
 class OtaUpdater {
@@ -19,6 +18,8 @@ class OtaUpdater {
   std::string lastError;
 
  public:
+  using ProgressCallback = void (*)(void* ctx);
+
   enum OtaUpdaterError {
     OK = 0,
     NO_UPDATE,
@@ -45,8 +46,6 @@ class OtaUpdater {
   void setLastError(const std::string& err);
   void setExpectedSize(size_t s);
   void setProcessed(size_t s);
-
-  using ProgressCallback = void (*)(void* ctx);
 
   OtaUpdater() = default;
   bool isUpdateNewer() const;

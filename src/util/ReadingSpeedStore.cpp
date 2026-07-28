@@ -92,6 +92,33 @@ BookStats* find(Library& lib, const std::string& path) {
   return nullptr;
 }
 
+bool rekeyBook(Library& lib, const std::string& oldPath, const std::string& newPath) {
+  if (oldPath == newPath) return false;
+
+  std::size_t oldIdx = lib.books.size();
+  std::size_t newIdx = lib.books.size();
+  for (std::size_t i = 0; i < lib.books.size(); i++) {
+    if (lib.books[i].path == oldPath) oldIdx = i;
+    if (lib.books[i].path == newPath) newIdx = i;
+  }
+  if (oldIdx == lib.books.size()) return false;
+
+  if (newIdx == lib.books.size()) {
+    lib.books[oldIdx].path = newPath;
+    return true;
+  }
+
+  // Destination already exists (the book was moved back and forth, or a
+  // same-named file was read at the destination). Merge rather than drop.
+  auto& dst = lib.books[newIdx];
+  auto& src = lib.books[oldIdx];
+  dst.durations.reserve(dst.durations.size() + src.durations.size());
+  dst.durations.insert(dst.durations.end(), src.durations.begin(), src.durations.end());
+  if (dst.title.empty()) dst.title = src.title;
+  lib.books.erase(lib.books.begin() + static_cast<long>(oldIdx));
+  return true;
+}
+
 void addDuration(Library& lib, const std::string& path, const std::string& title, uint32_t sec,
                  std::size_t maxKeep) {
   BookStats* b = find(lib, path);

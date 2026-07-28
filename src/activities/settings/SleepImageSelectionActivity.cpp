@@ -132,7 +132,7 @@ void SleepImageSelectionActivity::render(RenderLock&&) {
   const int previewY = OVERLAY_HEIGHT;
   const int previewHeight = pageHeight - OVERLAY_HEIGHT;
 
-  FsFile file;
+  HalFile file;
   const auto& path = imagePaths[currentIndex];
   if (!Storage.openFileForRead("SIS", path, file)) {
     LOG_ERR("SIS", "Failed to open %s", path.c_str());

@@ -6,7 +6,6 @@
 #include <algorithm>
 
 #include "CrossPointSettings.h"
-#include "FontSelectionActivity.h"
 #include "MappedInputManager.h"
 #include "SettingsList.h"
 #include "components/UITheme.h"
@@ -18,10 +17,6 @@ ReaderOptionsActivity::ReaderOptionsActivity(GfxRenderer& renderer, MappedInputM
 std::vector<SettingInfo> ReaderOptionsActivity::buildSettings(bool forTxtReader) {
   std::vector<SettingInfo> result;
   result.reserve(20);
-
-  // Order: Font selection (action) first, then Reader/Controls categories,
-  // then Sunlight fading fix at the very end (display category, by request).
-  result.push_back(SettingInfo::Action(StrId::STR_FONT_FAMILY, SettingAction::FontSelection));
 
   for (const auto& s : getSettingsList()) {
     if (s.type != SettingType::TOGGLE && s.type != SettingType::ENUM && s.type != SettingType::VALUE) {
@@ -133,9 +128,6 @@ void ReaderOptionsActivity::toggleCurrentSetting() {
     } else {
       SETTINGS.*(setting.valuePtr) = currentValue + setting.valueRange.step;
     }
-  } else if (setting.type == SettingType::ACTION && setting.action == SettingAction::FontSelection) {
-    startActivityForResult(std::make_unique<FontSelectionActivity>(renderer, mappedInput),
-                           [](const ActivityResult&) { SETTINGS.saveToFile(); });
   }
 }
 
@@ -167,8 +159,6 @@ void ReaderOptionsActivity::render(RenderLock&&) {
           }
         } else if (setting.type == SettingType::VALUE && setting.valuePtr != nullptr) {
           valueText = std::to_string(SETTINGS.*(setting.valuePtr));
-        } else if (setting.type == SettingType::ACTION && setting.action == SettingAction::FontSelection) {
-          valueText = SETTINGS.getCustomFontName();
         }
         return valueText;
       },

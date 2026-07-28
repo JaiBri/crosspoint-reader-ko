@@ -8,12 +8,13 @@
 #include <cstring>
 #include <string>
 
+#include "I18nKeys.h"
 #include "fontIds.h"
 
 // Initialize the static instance
 CrossPointSettings CrossPointSettings::instance;
 
-void readAndValidate(FsFile& file, uint8_t& member, const uint8_t maxValue) {
+void readAndValidate(HalFile& file, uint8_t& member, const uint8_t maxValue) {
   uint8_t tempValue;
   serialization::readPod(file, tempValue);
   if (tempValue < maxValue) {
@@ -27,6 +28,8 @@ constexpr uint8_t SETTINGS_COUNT = 31;
 constexpr char SETTINGS_FILE_BIN[] = "/.crosspoint/settings.bin";
 constexpr char SETTINGS_FILE_JSON[] = "/.crosspoint/settings.json";
 constexpr char SETTINGS_FILE_BAK[] = "/.crosspoint/settings.bin.bak";
+constexpr char LANG_FILE_BIN[] = "/.crosspoint/language.bin";
+constexpr char LANG_FILE_BAK[] = "/.crosspoint/language.bin.bak";
 
 // Convert legacy front button layout into explicit logical->hardware mapping.
 void applyLegacyFrontButtonLayout(CrossPointSettings& settings) {
@@ -77,6 +80,22 @@ void CrossPointSettings::validateFrontButtonMapping(CrossPointSettings& settings
   }
 }
 
+uint8_t CrossPointSettings::sleepTimeoutEnumToMinutes(const uint8_t legacyValue) {
+  switch (legacyValue) {
+    case SLEEP_1_MIN:
+      return 1;
+    case SLEEP_5_MIN:
+      return 5;
+    case SLEEP_15_MIN:
+      return 15;
+    case SLEEP_30_MIN:
+      return 30;
+    case SLEEP_10_MIN:
+    default:
+      return 10;
+  }
+}
+
 bool CrossPointSettings::saveToFile() const {
   Storage.mkdir("/.crosspoint");
   return JsonSettingsIO::saveSettings(*this, SETTINGS_FILE_JSON);
@@ -96,6 +115,7 @@ bool CrossPointSettings::loadFromFile() {
           LOG_ERR("CPS", "Failed to resave settings after format update");
         }
       }
+      migrateLanguageBinaryFile();
       return result;
     }
   }
@@ -103,6 +123,7 @@ bool CrossPointSettings::loadFromFile() {
   // Fall back to binary migration
   if (Storage.exists(SETTINGS_FILE_BIN)) {
     if (loadFromBinaryFile()) {
+      migrateLanguageBinaryFile();
       if (saveToFile()) {
         Storage.rename(SETTINGS_FILE_BIN, SETTINGS_FILE_BAK);
         LOG_DBG("CPS", "Migrated settings.bin to settings.json");
@@ -114,11 +135,35 @@ bool CrossPointSettings::loadFromFile() {
     }
   }
 
-  return false;
+  // No settings files at all -- check for standalone language.bin
+  return migrateLanguageBinaryFile();
+}
+
+bool CrossPointSettings::migrateLanguageBinaryFile() {
+  // V1_LANGUAGES / V1_LANGUAGE_COUNT are emitted by gen_i18n.py with the
+  // frozen enum order from 2f969a9.
+  if (!Storage.exists(LANG_FILE_BIN)) return false;
+
+  HalFile f;
+  if (Storage.openFileForRead("CPS", LANG_FILE_BIN, f)) {
+    uint8_t version;
+    serialization::readPod(f, version);
+    if (version == 1) {
+      uint8_t oldIndex;
+      serialization::readPod(f, oldIndex);
+      if (oldIndex < V1_LANGUAGE_COUNT) {
+        language = static_cast<uint8_t>(V1_LANGUAGES[oldIndex]);
+      }
+    }
+  }
+  Storage.rename(LANG_FILE_BIN, LANG_FILE_BAK);
+  saveToFile();
+  LOG_DBG("CPS", "Migrated language.bin into settings.json");
+  return true;
 }
 
 bool CrossPointSettings::loadFromBinaryFile() {
-  FsFile inputFile;
+  HalFile inputFile;
   if (!Storage.openFileForRead("CPS", SETTINGS_FILE_BIN, inputFile)) {
     return false;
   }
@@ -192,7 +237,9 @@ bool CrossPointSettings::loadFromBinaryFile() {
 
     readAndValidate(inputFile, paragraphAlignment, PARAGRAPH_ALIGNMENT_COUNT);
     if (++settingsRead >= fileSettingsCount) break;
-    readAndValidate(inputFile, sleepTimeout, SLEEP_TIMEOUT_COUNT);
+    uint8_t legacySleepTimeout = SLEEP_10_MIN;
+    readAndValidate(inputFile, legacySleepTimeout, SLEEP_TIMEOUT_COUNT);
+    sleepTimeoutMinutes = sleepTimeoutEnumToMinutes(legacySleepTimeout);
     if (++settingsRead >= fileSettingsCount) break;
     readAndValidate(inputFile, refreshFrequency, REFRESH_FREQUENCY_COUNT);
     if (++settingsRead >= fileSettingsCount) break;
@@ -211,7 +258,7 @@ bool CrossPointSettings::loadFromBinaryFile() {
     if (++settingsRead >= fileSettingsCount) break;
     readAndValidate(inputFile, hideBatteryPercentage, HIDE_BATTERY_PERCENTAGE_COUNT);
     if (++settingsRead >= fileSettingsCount) break;
-    serialization::readPod(inputFile, longPressChapterSkip);
+    readAndValidate(inputFile, longPressButtonBehavior, LONG_PRESS_BUTTON_BEHAVIOR_COUNT);
     if (++settingsRead >= fileSettingsCount) break;
     // Version 4+: Custom font path
     if (version >= 4) {
@@ -264,6 +311,8 @@ bool CrossPointSettings::loadFromBinaryFile() {
     if (++settingsRead >= fileSettingsCount) break;
     serialization::readPod(inputFile, embeddedStyle);
     if (++settingsRead >= fileSettingsCount) break;
+    serialization::readPod(inputFile, frontButtonFollowOrientation);
+    if (++settingsRead >= fileSettingsCount) break;
   } while (false);
 
   if (frontButtonMappingRead) {
@@ -277,7 +326,10 @@ bool CrossPointSettings::loadFromBinaryFile() {
 }
 
 float CrossPointSettings::getReaderLineCompression() const {
-  // Fixed to KoPub Batang 14pt font
+  // Korean line spacing: identical for the default KoPub Batang flash font AND any SD .epdfont
+  // reader font. The upstream font-family-conditional values (Bookerly/NotoSans) are not used in
+  // the Korean build — every reader font gets the same Korean line-height multiplier so line
+  // spacing matches 1.2.0-ko regardless of which font is selected.
   switch (lineSpacing) {
     case TIGHT:
       return 1.00f;
@@ -290,19 +342,10 @@ float CrossPointSettings::getReaderLineCompression() const {
 }
 
 unsigned long CrossPointSettings::getSleepTimeoutMs() const {
-  switch (sleepTimeout) {
-    case SLEEP_1_MIN:
-      return 1UL * 60 * 1000;
-    case SLEEP_5_MIN:
-      return 5UL * 60 * 1000;
-    case SLEEP_10_MIN:
-    default:
-      return 10UL * 60 * 1000;
-    case SLEEP_15_MIN:
-      return 15UL * 60 * 1000;
-    case SLEEP_30_MIN:
-      return 30UL * 60 * 1000;
-  }
+  if (sleepTimeoutMinutes >= SLEEP_TIMEOUT_NEVER_MINUTES) return 0UL;
+  const uint8_t minutes =
+      std::clamp(sleepTimeoutMinutes, MIN_SLEEP_TIMEOUT_MINUTES, static_cast<uint8_t>(SLEEP_TIMEOUT_NEVER_MINUTES - 1));
+  return static_cast<unsigned long>(minutes) * 60UL * 1000UL;
 }
 
 int CrossPointSettings::getRefreshFrequency() const {
@@ -322,21 +365,10 @@ int CrossPointSettings::getRefreshFrequency() const {
 }
 
 int CrossPointSettings::getReaderFontId() const {
-  // Return custom font ID if a custom font is configured
-  // The actual font loading and availability check happens in main.cpp
-  if (hasCustomFont()) {
-    // Generate unique negative ID based on font path hash
-    // This ensures different custom fonts have different IDs for cache invalidation
-    uint32_t hash = 5381;
-    for (const char* p = customFontPath; *p; p++) {
-      hash = ((hash << 5) + hash) + static_cast<uint8_t>(*p);  // djb2 hash
-    }
-    // Return negative value to avoid collision with built-in font IDs
-    // Mask to ensure it stays in valid range
-    return -static_cast<int>((hash & 0x7FFFFFFF) | 1);
-  }
-  // Default to KoPub Batang 14pt for Korean reader
-  return KOPUB_14_FONT_ID;
+  // When a custom SD reader font is set, the reader must render with the same id the font was
+  // registered under (CUSTOM_FONT_ID). CUSTOM_FONT_ID is also the cache-invalidation key, so
+  // switching custom fonts naturally invalidates section caches. Otherwise the built-in KoPub.
+  return hasCustomFont() ? CUSTOM_FONT_ID : KOPUB_14_FONT_ID;
 }
 
 int CrossPointSettings::getUiFontId() const {
@@ -352,6 +384,24 @@ const char* CrossPointSettings::getCustomFontName() const {
   const char* lastSlash = strrchr(customFontPath, '/');
   const char* filename = lastSlash ? lastSlash + 1 : customFontPath;
   // Remove .bin extension for display
+  static char nameBuffer[32];
+  strncpy(nameBuffer, filename, sizeof(nameBuffer) - 1);
+  nameBuffer[sizeof(nameBuffer) - 1] = '\0';
+  char* dot = strrchr(nameBuffer, '.');
+  if (dot) {
+    *dot = '\0';
+  }
+  return nameBuffer;
+}
+
+const char* CrossPointSettings::getSystemFontName() const {
+  if (!hasSystemFont()) {
+    return "Pretendard (기본)";
+  }
+  // Extract filename from path (e.g., "/fonts/NotoCJK.epdfont" -> "NotoCJK")
+  const char* lastSlash = strrchr(systemFontPath, '/');
+  const char* filename = lastSlash ? lastSlash + 1 : systemFontPath;
+  // Remove extension for display
   static char nameBuffer[32];
   strncpy(nameBuffer, filename, sizeof(nameBuffer) - 1);
   nameBuffer[sizeof(nameBuffer) - 1] = '\0';

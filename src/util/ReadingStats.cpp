@@ -26,7 +26,7 @@ uint32_t readU32(const uint8_t* buf) {
 bool ReadingStats::load(const std::string& cachePath, ReadingStats& out) {
   out = ReadingStats{};
 
-  FsFile f;
+  HalFile f;
   if (!Storage.openFileForRead(MODULE, cachePath + FILENAME, f)) {
     return false;
   }
@@ -54,7 +54,7 @@ bool ReadingStats::load(const std::string& cachePath, ReadingStats& out) {
 }
 
 bool ReadingStats::save(const std::string& cachePath, const ReadingStats& stats) {
-  FsFile f;
+  HalFile f;
   if (!Storage.openFileForWrite(MODULE, cachePath + FILENAME, f)) {
     LOG_ERR(MODULE, "Failed to open stats for write");
     return false;

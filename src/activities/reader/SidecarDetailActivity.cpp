@@ -64,7 +64,7 @@ void SidecarDetailActivity::loop() {
 
   // Confirm -> Jump to the location.
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    setResult(SyncResult{spine, page});
+    setResult(ProgressChangeResult{spine, page});
     finish();
     return;
   }
@@ -89,7 +89,7 @@ void SidecarDetailActivity::loop() {
   // page-fwd -> Edit comment (keyboard prefilled with the current note).
   if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
     startActivityForResult(
-        std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_ADD_COMMENT), note, 0, false),
+        std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_ADD_COMMENT), note, 0, InputType::Text),
         [this](const ActivityResult& r) {
           if (!r.isCancelled) {
             note = std::get<KeyboardResult>(r.data).text;

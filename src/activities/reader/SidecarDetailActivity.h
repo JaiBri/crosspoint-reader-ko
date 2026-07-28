@@ -12,7 +12,7 @@
 // the side Up/Down buttons when it is longer than one screen) + the user's
 // comment underneath. Buttons:
 //   Back        -> return to the list (cancelled)
-//   Confirm     -> Jump: returns SyncResult{spine, page} to the list
+//   Confirm     -> Jump: returns ProgressChangeResult{spine, page} to the list
 //   page-back   -> Delete: asks to confirm, then calls onDelete() and finishes
 //   page-fwd    -> Edit: opens the keyboard, then calls onEditNote(newNote)
 // Pure callbacks (no concrete model dependency) so it serves both highlights

@@ -1,5 +1,6 @@
 #include "TxtReaderActivity.h"
 
+#include <BidiUtils.h>
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -549,6 +550,9 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, bool firstLineIsParagrap
   }
   buffer[chunkSize] = '\0';
 
+  // SD-card (.epdfont) fonts stream glyph metrics on demand via SdFont's own glyph cache;
+  // no separate advance-table prewarm is needed here.
+
   const int lineHeight = renderer.getLineHeight(cachedFontId) * cachedLineCompression;
   // Track accumulated y to enforce height-based pagination. Extra paragraph
   // spacing is added BEFORE the leading line of each new paragraph (except
@@ -615,56 +619,61 @@ bool TxtReaderActivity::loadPageAtOffset(size_t offset, bool firstLineIsParagrap
     bool isFirstSegmentOfSourceLine = true;
     bool extraSpacingApplied = false;
 
-    // Word wrap if needed - use binary search for performance with SD fonts.
-    // The size guard is a defensive belt-and-braces check; tryAddLine() also
-    // gates on capacity and will break out when full.
-    // cppcheck-suppress knownConditionTrueFalse
-    while (!line.empty() && static_cast<int>(outLines.size()) < maxLinesPerPage) {
-      const int effectiveWidth = isFirstSegmentOfSourceLine ? viewportWidth - firstSegmentIndent : viewportWidth;
-      // Use binary search to find break position (much faster than linear search)
-      size_t breakPos = findBreakPosition(renderer, cachedFontId, line, effectiveWidth);
+    if (line.empty()) {
+      // Blank source line — emit one empty visual line to preserve paragraph whitespace.
+      tryAddLine("", true, isFirstSegmentOfSourceLine && sourceLineStartsParagraph, needsExtraSpacingBefore);
+    } else {
+      // Word wrap if needed - use binary search for performance with SD fonts.
+      // The size guard is a defensive belt-and-braces check; tryAddLine() also
+      // gates on capacity and will break out when full.
+      // cppcheck-suppress knownConditionTrueFalse
+      while (!line.empty() && static_cast<int>(outLines.size()) < maxLinesPerPage) {
+        const int effectiveWidth = isFirstSegmentOfSourceLine ? viewportWidth - firstSegmentIndent : viewportWidth;
+        // Use binary search to find break position (much faster than linear search)
+        size_t breakPos = findBreakPosition(renderer, cachedFontId, line, effectiveWidth);
 
-      const bool needsSpacing = needsExtraSpacingBefore && isFirstSegmentOfSourceLine && !extraSpacingApplied;
+        const bool needsSpacing = needsExtraSpacingBefore && isFirstSegmentOfSourceLine && !extraSpacingApplied;
 
-      if (breakPos >= line.length()) {
-        // Whole line fits character-wise — this is the last segment of a
-        // source line, so it marks the end of a paragraph (the next line in
-        // the source starts a new paragraph).
-        if (!tryAddLine(line, true, isFirstSegmentOfSourceLine && sourceLineStartsParagraph, needsSpacing)) {
-          // Failed at viewport check. Break out so the partial-consumption
-          // path below advances pos by lineBytePos (any prior wrapped
-          // segments of this source line that we already added) — using
-          // goto here would skip that and the next page would re-render
-          // those segments.
+        if (breakPos >= line.length()) {
+          // Whole line fits character-wise — this is the last segment of a
+          // source line, so it marks the end of a paragraph (the next line in
+          // the source starts a new paragraph).
+          if (!tryAddLine(line, true, isFirstSegmentOfSourceLine && sourceLineStartsParagraph, needsSpacing)) {
+            // Failed at viewport check. Break out so the partial-consumption
+            // path below advances pos by lineBytePos (any prior wrapped
+            // segments of this source line that we already added) — using
+            // goto here would skip that and the next page would re-render
+            // those segments.
+            break;
+          }
+          if (needsSpacing) extraSpacingApplied = true;
+          lineBytePos = displayLen;
+          line.clear();
+          break;
+        }
+
+        if (breakPos == 0) {
+          breakPos = 1;  // Ensure progress
+        }
+
+        if (!tryAddLine(line.substr(0, breakPos), false, isFirstSegmentOfSourceLine && sourceLineStartsParagraph,
+                        needsSpacing)) {
+          // Same rationale as above: prior wrapped segments may already be in
+          // outLines, so we must advance pos by lineBytePos rather than
+          // jumping over the partial-consumption update.
           break;
         }
         if (needsSpacing) extraSpacingApplied = true;
-        lineBytePos = displayLen;
-        line.clear();
-        break;
-      }
+        isFirstSegmentOfSourceLine = false;
 
-      if (breakPos == 0) {
-        breakPos = 1;  // Ensure progress
+        // Skip space at break point
+        size_t skipChars = breakPos;
+        if (breakPos < line.length() && line[breakPos] == ' ') {
+          skipChars++;
+        }
+        lineBytePos += skipChars;
+        line = line.substr(skipChars);
       }
-
-      if (!tryAddLine(line.substr(0, breakPos), false, isFirstSegmentOfSourceLine && sourceLineStartsParagraph,
-                      needsSpacing)) {
-        // Same rationale as above: prior wrapped segments may already be in
-        // outLines, so we must advance pos by lineBytePos rather than
-        // jumping over the partial-consumption update.
-        break;
-      }
-      if (needsSpacing) extraSpacingApplied = true;
-      isFirstSegmentOfSourceLine = false;
-
-      // Skip space at break point
-      size_t skipChars = breakPos;
-      if (breakPos < line.length() && line[breakPos] == ' ') {
-        skipChars++;
-      }
-      lineBytePos += skipChars;
-      line = line.substr(skipChars);
     }
 
     // Determine how much of the source buffer we consumed
@@ -752,10 +761,17 @@ size_t TxtReaderActivity::findBackwardPageStart(size_t endOffset) const {
   // is our answer.
   while (cursor < endOffset) {
     size_t next = cursor;
-    // Backward scan: cursor is always at a snapped line start, so the leading
-    // source line on the synthetic page is by definition a paragraph start.
-    if (!const_cast<TxtReaderActivity*>(this)->loadPageAtOffset(cursor, /*firstLineIsParagraphStart=*/true, lines,
-                                                                nullptr, nullptr, next)) {
+    // The leading source line is a paragraph start only when cursor actually
+    // sits at a line boundary. Only the first cursor (snapToLineStart above) is
+    // guaranteed to be one; every subsequent cursor is the previous synthetic
+    // page's end, which usually lands mid-paragraph. Forward rendering decides
+    // this via isOffsetAtLineStart() (see render()), so mirror it exactly here —
+    // otherwise the reconstructed pages get different paragraph spacing/indent,
+    // their height-based boundaries drift from the forward pages, and Back lands
+    // on a misaligned offset (issue #17 "text shifted to a different part").
+    const bool firstLineIsParagraphStart = isOffsetAtLineStart(cursor);
+    if (!const_cast<TxtReaderActivity*>(this)->loadPageAtOffset(cursor, firstLineIsParagraphStart, lines, nullptr,
+                                                                nullptr, next)) {
       break;
     }
     if (next <= cursor) break;
@@ -891,37 +907,49 @@ void TxtReaderActivity::renderPage() {
         const int indent = (cachedParagraphIndent && startsParagraph) ? paragraphIndentPx : 0;
         const int effectiveContentWidth = contentWidth - indent;
         int x = cachedOrientedMarginLeft + indent;
+        // RTL detection: if a line starts with RTL text, switch to right-aligned
+        // rendering so Arabic/Hebrew text doesn't appear left-justified by default.
+        const bool lineIsRtl = BidiUtils::startsWithRtl(line.c_str(), BidiUtils::RTL_PARAGRAPH_PROBE_DEPTH);
+        uint8_t effectiveAlignment = cachedParagraphAlignment;
+        if (lineIsRtl && (effectiveAlignment == CrossPointSettings::LEFT_ALIGN ||
+                          effectiveAlignment == CrossPointSettings::JUSTIFIED)) {
+          effectiveAlignment = CrossPointSettings::RIGHT_ALIGN;
+        }
         // A line is "soft-wrapped" (safe to justify by widening gaps) when it
         // didn't consume a full source line AND it isn't the last line on the
         // page (the last line may actually continue on the next page even if
         // we didn't track it as wrapped).
         const bool isLastLineOnPage = (i + 1 == lineCount);
         const bool canJustify = !endsParagraph && !isLastLineOnPage;
+        // Pre-compute text width once for use in alignment calculations.
+        const int textWidth = renderer.getTextAdvanceX(cachedFontId, line.c_str(), EpdFontFamily::REGULAR);
 
         // Apply text alignment
         int8_t letterSpacing = 0;
-        switch (cachedParagraphAlignment) {
+        switch (effectiveAlignment) {
           case CrossPointSettings::LEFT_ALIGN:
           default:
             // x already set to left margin (+ indent)
             break;
           case CrossPointSettings::CENTER_ALIGN: {
-            int textWidth = renderer.getTextWidth(cachedFontId, line.c_str());
             // Center within the indented content box so wrapped continuations
             // don't drift left of the paragraph's first line.
             x = cachedOrientedMarginLeft + indent + (effectiveContentWidth - textWidth) / 2;
             break;
           }
           case CrossPointSettings::RIGHT_ALIGN: {
-            int textWidth = renderer.getTextWidth(cachedFontId, line.c_str());
             x = cachedOrientedMarginLeft + contentWidth - textWidth;
             break;
           }
           case CrossPointSettings::JUSTIFIED:
             if (canJustify) {
-              const int textWidth = renderer.getTextWidth(cachedFontId, line.c_str());
               const int extra = effectiveContentWidth - textWidth;
-              const int gaps = renderer.countUtf8Chars(line.c_str()) - 1;
+              // Count UTF-8 characters (lead bytes) to distribute justification gaps.
+              int utf8Chars = 0;
+              for (const char* p = line.c_str(); *p; ++p) {
+                if ((static_cast<uint8_t>(*p) & 0xC0) != 0x80) ++utf8Chars;
+              }
+              const int gaps = utf8Chars - 1;
               if (extra > 0 && gaps > 0) {
                 // drawText's letterSpacing is an int8_t; clamp to ±127. For
                 // typical reading layouts the per-gap extra is single digits,
@@ -975,7 +1003,7 @@ void TxtReaderActivity::renderStatusBar() const {
 }
 
 void TxtReaderActivity::saveProgress() const {
-  FsFile f;
+  HalFile f;
   if (!Storage.openFileForWrite("TRS", txt->getCachePath() + "/progress.bin", f)) {
     return;
   }
@@ -998,7 +1026,7 @@ void TxtReaderActivity::loadProgress() {
   currentOffset = 0;
   currentEndOffset = 0;
 
-  FsFile f;
+  HalFile f;
   if (!Storage.openFileForRead("TRS", txt->getCachePath() + "/progress.bin", f)) {
     return;
   }
@@ -1058,4 +1086,18 @@ void TxtReaderActivity::loadProgress() {
     LOG_DBG("TRS", "Loaded progress: offset %zu / %zu (%.0f%%)", currentOffset, fileSize,
             fileSize ? currentOffset * 100.0f / fileSize : 0.0f);
   }
+}
+
+ScreenshotInfo TxtReaderActivity::getScreenshotInfo() const {
+  ScreenshotInfo info;
+  info.readerType = ScreenshotInfo::ReaderType::Txt;
+  if (txt) {
+    const std::string t = txt->getTitle();
+    snprintf(info.title, sizeof(info.title), "%s", t.c_str());
+  }
+  info.currentPage = estimatedCurrentPage();
+  info.totalPages = estimatedTotalPages();
+  info.progressPercent = fileSize > 0 ? static_cast<int>(currentOffset * 100.0f / fileSize + 0.5f) : 0;
+  if (info.progressPercent > 100) info.progressPercent = 100;
+  return info;
 }

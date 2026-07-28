@@ -12,6 +12,11 @@ class EpdFont {
 
   const EpdGlyph* getGlyph(uint32_t cp) const;
 
+  /// Returns true only if this font actually contains a real glyph for \p cp.
+  /// Unlike getGlyph(), this never falls back to the U+FFFD replacement glyph,
+  /// so it can be used to decide whether a glyph-level fallback font is needed.
+  bool hasGlyph(uint32_t cp) const;
+
   /// Returns the kerning adjustment (4.4 fixed-point in pixels) between two codepoints.
   /// Returns 0 if no kerning data exists for the pair.
   int8_t getKerning(uint32_t leftCp, uint32_t rightCp) const;

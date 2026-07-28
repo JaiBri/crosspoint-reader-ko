@@ -4,10 +4,12 @@
 #include <Epub/Section.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "EpubReaderMenuActivity.h"
+#include "ProgressMapper.h"
 #include "activities/Activity.h"
 #include "util/HighlightStore.h"
 #include "util/ReadingSpeedStore.h"
@@ -20,6 +22,7 @@ class EpubReaderActivity final : public Activity {
   std::unique_ptr<Section> section = nullptr;
   int currentSpineIndex = 0;
   int nextPageNumber = 0;
+  std::optional<uint16_t> pendingPageJump;
   // Set when navigating to a footnote href with a fragment (e.g. #note1).
   // Cleared on the next render after the new section loads and resolves it to a page.
   std::string pendingAnchor;
@@ -35,8 +38,18 @@ class EpubReaderActivity final : public Activity {
   // Normalized 0.0-1.0 progress within the target spine item, computed from book percentage.
   float pendingSpineProgress = 0.0f;
   bool pendingScreenshot = false;
+  bool pendingSyncSaveError = false;
   bool skipNextButtonCheck = false;  // Skip button processing for one frame after subactivity exit
   bool automaticPageTurnActive = false;
+  bool showBookmarkMessage = false;
+  bool ignoreNextConfirmRelease = false;
+  // Tracks whether this book is currently removed from Recent Books by the
+  // removeReadBooksFromRecents feature (set at End-of-Book, cleared if paged back in).
+  bool recentsEntryRemoved = false;
+  unsigned long bookmarkMessageTime = 0UL;
+  // Set when the reader is left at end-of-book and SETTINGS.moveFinishedToReadFolder is on.
+  // Consumed in onExit() to relocate the finished book into /Read/.
+  bool pendingReadFolderMove = false;
 
   // Per-book reading-time accumulator. Loaded in onEnter, ticked in loop,
   // saved on mid-cadence and onExit. See util/ReadingTimer.h for semantics.
@@ -133,7 +146,11 @@ class EpubReaderActivity final : public Activity {
   void openHighlightsList();
 
   // Bookmarks (whole-page marks; stored in the same sidecar file).
-  void addBookmarkForCurrentPage();  // build pendingBookmark, then the optional-comment chain
+  // Fill pendingBookmark from the current page under a RenderLock. False if
+  // there is no section. Shared by the menu path (which then prompts for a
+  // comment) and the Confirm-hold gesture (which stores immediately).
+  bool capturePendingBookmark();
+  void addBookmarkForCurrentPage();  // capture, then the optional-comment chain
   void promptForBookmarkComment();
   void storePendingBookmark();
   void openBookmarksList();
@@ -148,7 +165,7 @@ class EpubReaderActivity final : public Activity {
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
-  void saveProgress(int spineIndex, int currentPage, int pageCount);
+  bool saveProgress(int spineIndex, int currentPage, int pageCount);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);
   // Jump to a normalized 0.0-1.0 position within a known spine item. The page is
@@ -159,6 +176,7 @@ class EpubReaderActivity final : public Activity {
   void applyOrientation(uint8_t orientation);
   void toggleAutoPageTurn(uint8_t selectedPageTurnOption);
   void pageTurn(bool isForwardTurn);
+  void addBookmark();
 
   // Reading-speed helpers (see the readingLibrary members above).
   void loadReadingSpeed();                     // parse the global file + prime the median cache
@@ -181,4 +199,6 @@ class EpubReaderActivity final : public Activity {
   // Prevent auto-sleep while auto page-turn is running so long unattended
   // reads don't get cut off by the global inactivity timer.
   bool preventAutoSleep() override { return automaticPageTurnActive; }
+  ScreenshotInfo getScreenshotInfo() const override;
+  CrossPointPosition getCurrentPosition() const;
 };

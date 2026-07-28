@@ -50,8 +50,18 @@ struct Library {
 uint32_t medianSecPerPage(const std::vector<uint32_t>& durations, uint32_t minSec, uint32_t maxSec,
                           std::size_t& outCount);
 
+// Canonical location of the global reading-speed file.
+inline constexpr const char* kLibraryPath = "/.crosspoint/reading_speed.md";
+
 // Find a book by path. Returns nullptr if absent.
 BookStats* find(Library& lib, const std::string& path);
+
+// Repoint a book's entry from `oldPath` to `newPath`, e.g. when a finished book
+// is moved into /read. Returns false (leaving the library untouched) when the
+// old path is absent. If `newPath` already has an entry, the two are merged —
+// `oldPath`'s durations are appended and its entry removed — so a move onto an
+// existing key never silently discards samples.
+bool rekeyBook(Library& lib, const std::string& oldPath, const std::string& newPath);
 
 // Append one page duration for `path` (creating the book entry and setting its
 // title if absent; refreshing a non-empty title otherwise). Trims to the newest

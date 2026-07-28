@@ -1,9 +1,11 @@
 #include "I18n.h"
 
 #include <HalStorage.h>
-#include <HardwareSerial.h>
 #include <Logging.h>
 #include <Serialization.h>
+
+#include <cstddef>
+#include <cstring>
 
 #include "I18nStrings.h"
 
@@ -20,6 +22,50 @@ static constexpr uint8_t V1_KOREAN_INDEX = 11;
 
 I18n& I18n::getInstance() {
   static I18n instance;
+  static bool loaded = false;
+  if (!loaded) {
+    loaded = true;
+    HalFile file;
+    if (Storage.openFileForRead("I18N", SETTINGS_FILE, file)) {
+      uint8_t version;
+      serialization::readPod(file, version);
+      if (version > SETTINGS_VERSION) {
+        LOG_DBG("I18N", "Settings version %u newer than supported %u, using default", version, SETTINGS_VERSION);
+        file.close();
+      } else {
+        uint8_t lang;
+        serialization::readPod(file, lang);
+        file.close();
+
+        // v1 -> v2 migration: Korean shifted from enum index 11 to 12 when upstream
+        // 1.2.0 inserted Belarusian. Remap to the current KOREAN index so v1 users
+        // don't boot into Cyrillic.
+        if (version == 1 && lang == V1_KOREAN_INDEX) {
+          lang = static_cast<uint8_t>(Language::KOREAN);
+          LOG_DBG("I18N", "Migrated v1 Korean index %u -> %u", V1_KOREAN_INDEX, lang);
+        }
+
+        if (lang < static_cast<uint8_t>(Language::_COUNT)) {
+          instance._language = static_cast<Language>(lang);
+          LOG_DBG("I18N", "Loaded language: %d", static_cast<int>(instance._language));
+        }
+
+        // Persist with current version so migration runs only once per device.
+        if (version != SETTINGS_VERSION) {
+          Storage.mkdir("/.crosspoint");
+          HalFile saveFile;
+          if (Storage.openFileForWrite("I18N", SETTINGS_FILE, saveFile)) {
+            serialization::writePod(saveFile, SETTINGS_VERSION);
+            serialization::writePod(saveFile, static_cast<uint8_t>(instance._language));
+            saveFile.close();
+            LOG_DBG("I18N", "Migrated settings to version %u", SETTINGS_VERSION);
+          }
+        }
+      }
+    } else {
+      LOG_DBG("I18N", "No settings file, using default");
+    }
+  }
   return instance;
 }
 
@@ -30,8 +76,12 @@ const char* I18n::get(StrId id) const {
   }
 
   // Use generated helper function - no hardcoded switch needed!
-  const char* const* strings = getStringArray(_language);
-  return strings[index];
+  const LangStrings lang = getLanguageStrings(_language);
+
+  // If bit 15 of the offset is set, apply the offset to the English lookup table
+  const uint16_t off = lang.offsets[index];
+  if (off & 0x8000) return STRINGS_EN_DATA + (off & 0x7FFF);
+  return lang.data + off;
 }
 
 void I18n::setLanguage(Language lang) {
@@ -39,7 +89,18 @@ void I18n::setLanguage(Language lang) {
     return;
   }
   _language = lang;
-  saveSettings();
+
+  // Persist language selection to SD card
+  Storage.mkdir("/.crosspoint");
+  HalFile file;
+  if (!Storage.openFileForWrite("I18N", SETTINGS_FILE, file)) {
+    LOG_ERR("I18N", "Failed to save language setting");
+    return;
+  }
+  serialization::writePod(file, SETTINGS_VERSION);
+  serialization::writePod(file, static_cast<uint8_t>(_language));
+  file.close();
+  LOG_DBG("I18N", "Settings saved: language=%d", static_cast<int>(_language));
 }
 
 const char* I18n::getLanguageName(Language lang) const {
@@ -50,57 +111,11 @@ const char* I18n::getLanguageName(Language lang) const {
   return LANGUAGE_NAMES[index];
 }
 
-void I18n::saveSettings() {
-  Storage.mkdir("/.crosspoint");
-
-  FsFile file;
-  if (!Storage.openFileForWrite("I18N", SETTINGS_FILE, file)) {
-    LOG_ERR("I18N", "Failed to save settings");
-    return;
+Language I18n::languageFromCode(const char* code) {
+  for (uint8_t i = 0; i < getLanguageCount(); i++) {
+    if (strcmp(code, LANGUAGE_CODES[i]) == 0) return static_cast<Language>(i);
   }
-
-  serialization::writePod(file, SETTINGS_VERSION);
-  serialization::writePod(file, static_cast<uint8_t>(_language));
-
-  file.close();
-  LOG_DBG("I18N", "Settings saved: language=%d", static_cast<int>(_language));
-}
-
-void I18n::loadSettings() {
-  FsFile file;
-  if (!Storage.openFileForRead("I18N", SETTINGS_FILE, file)) {
-    LOG_DBG("I18N", "No settings file, using default");
-    return;
-  }
-
-  uint8_t version;
-  serialization::readPod(file, version);
-  if (version > SETTINGS_VERSION) {
-    LOG_DBG("I18N", "Settings version %u newer than supported %u, using default", version, SETTINGS_VERSION);
-    return;
-  }
-
-  uint8_t lang;
-  serialization::readPod(file, lang);
-  file.close();
-
-  // v1 -> v2 migration: Korean shifted from enum index 11 to 12 when upstream
-  // 1.2.0 inserted Belarusian. Remap to the current KOREAN index so v1 users
-  // don't boot into Cyrillic.
-  if (version == 1 && lang == V1_KOREAN_INDEX) {
-    lang = static_cast<uint8_t>(Language::KOREAN);
-    LOG_DBG("I18N", "Migrated v1 Korean index %u -> %u", V1_KOREAN_INDEX, lang);
-  }
-
-  if (lang < static_cast<size_t>(Language::_COUNT)) {
-    _language = static_cast<Language>(lang);
-    LOG_DBG("I18N", "Loaded language: %d", static_cast<int>(_language));
-  }
-
-  // Persist with current version so migration runs only once per device.
-  if (version != SETTINGS_VERSION) {
-    saveSettings();
-  }
+  return Language::EN;
 }
 
 // Generate character set for a specific language

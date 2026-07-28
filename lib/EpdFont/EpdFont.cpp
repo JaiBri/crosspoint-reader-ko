@@ -176,3 +176,23 @@ const EpdGlyph* EpdFont::getGlyph(const uint32_t cp) const {
   }
   return nullptr;
 }
+
+bool EpdFont::hasGlyph(const uint32_t cp) const {
+  const int count = data->intervalCount;
+  if (count == 0) return false;
+
+  const EpdUnicodeInterval* intervals = data->intervals;
+  const auto* end = intervals + count;
+
+  // Same interval search as getGlyph(), but without the replacement-glyph fallback.
+  const auto it = std::upper_bound(
+      intervals, end, cp, [](uint32_t value, const EpdUnicodeInterval& interval) { return value < interval.first; });
+
+  if (it != intervals) {
+    const auto& interval = *(it - 1);
+    if (cp <= interval.last) {
+      return true;
+    }
+  }
+  return false;
+}

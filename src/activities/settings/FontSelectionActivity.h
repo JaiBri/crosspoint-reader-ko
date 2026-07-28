@@ -14,8 +14,13 @@
  */
 class FontSelectionActivity final : public ActivityWithSubactivity {
  public:
-  explicit FontSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
-      : ActivityWithSubactivity("FontSelection", renderer, mappedInput) {}
+  // Which font slot this picker configures:
+  //   Reader  -> SETTINGS.customFontPath (EPUB body font; default KoPub Batang)
+  //   System  -> SETTINGS.systemFontPath (UI glyph fallback; default Pretendard)
+  enum class Target { Reader, System };
+
+  explicit FontSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, Target target = Target::Reader)
+      : ActivityWithSubactivity("FontSelection", renderer, mappedInput), target_(target) {}
 
   void onEnter() override;
   void onExit() override;
@@ -26,9 +31,12 @@ class FontSelectionActivity final : public ActivityWithSubactivity {
   SemaphoreHandle_t displayMutex = nullptr;
   bool updateRequired = false;
 
+  Target target_ = Target::Reader;
   int selectedIndex = 0;
   std::vector<std::string> fontFiles;  // List of font file paths
   std::vector<std::string> fontNames;  // Display names (without path and extension)
+
+  bool isSystemTarget() const { return target_ == Target::System; }
 
   static void taskTrampoline(void* param);
   [[noreturn]] void displayTaskLoop();
@@ -38,6 +46,9 @@ class FontSelectionActivity final : public ActivityWithSubactivity {
 
   static constexpr const char* FONTS_DIR = "/.crosspoint/fonts";
   static constexpr const char* ROOT_FONTS_DIR = "/fonts";
+  static constexpr const char* HIDDEN_FONTS_DIR = "/.fonts";  // upstream hidden font root
 
-  void scanFontsInDirectory(const char* dirPath);
+  // Scans dirPath for .epdfont files; when recurseIntoSubdirs is true, also descends one level
+  // into per-family subfolders (layout /fonts/<Family>/<Family>_<size>.epdfont).
+  void scanFontsInDirectory(const char* dirPath, bool recurseIntoSubdirs = true);
 };

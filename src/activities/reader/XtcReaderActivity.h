@@ -9,6 +9,9 @@
 
 #include <Xtc.h>
 
+#include <string>
+#include <utility>
+
 #include "activities/Activity.h"
 
 class XtcReaderActivity final : public Activity {
@@ -17,7 +20,18 @@ class XtcReaderActivity final : public Activity {
   uint32_t currentPage = 0;
   int pagesUntilFullRefresh = 0;
 
+  enum class StatusBarOverlayPosition { Bottom, Top };
+  struct StatusBarInfo {
+    int currentPage;
+    int pageCount;
+    std::string title;
+  };
+
   void renderPage();
+  // XTG 1-bit page render via row-aligned band streaming (no large page buffer).
+  void renderStreaming1Bit(uint16_t pageWidth, uint16_t pageHeight);
+  void renderStatusBarOverlay(StatusBarOverlayPosition position) const;
+  StatusBarInfo getStatusBarInfo() const;
   void saveProgress() const;
   void loadProgress();
 
@@ -29,4 +43,5 @@ class XtcReaderActivity final : public Activity {
   void loop() override;
   void render(RenderLock&&) override;
   bool isReaderActivity() const override { return true; }
+  ScreenshotInfo getScreenshotInfo() const override;
 };

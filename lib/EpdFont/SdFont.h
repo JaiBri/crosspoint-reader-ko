@@ -17,7 +17,13 @@
 class GlyphBitmapCache {
  public:
   struct CacheEntry {
-    uint32_t codepoint;
+    // Composite (fontId<<32 | codepoint) key. The cache is shared across every
+    // SdFontData instance, so keying on codepoint alone would alias the same
+    // glyph across different fonts (e.g. a Hanja present in both the reader and
+    // the system font), returning one font's bitmap bytes for another font's
+    // metadata — a guaranteed size mismatch and heap over-read. Fold in the
+    // font identity so each font's glyphs occupy distinct cache slots.
+    uint64_t key;
     uint8_t* bitmap;
     uint32_t size;
   };
@@ -26,7 +32,7 @@ class GlyphBitmapCache {
   size_t maxCacheSize;
   size_t currentSize;
   std::list<CacheEntry> cacheList;  // Most recent at front
-  std::unordered_map<uint32_t, std::list<CacheEntry>::iterator> cacheMap;
+  std::unordered_map<uint64_t, std::list<CacheEntry>::iterator> cacheMap;
 
   void evictOldest();
 
@@ -35,10 +41,10 @@ class GlyphBitmapCache {
   ~GlyphBitmapCache();
 
   // Returns cached bitmap or nullptr if not cached
-  const uint8_t* get(uint32_t codepoint);
+  const uint8_t* get(uint64_t key);
 
   // Stores bitmap in cache, returns pointer to cached data
-  const uint8_t* put(uint32_t codepoint, const uint8_t* data, uint32_t size);
+  const uint8_t* put(uint64_t key, const uint8_t* data, uint32_t size);
 
   void clear();
   size_t getUsedSize() const { return currentSize; }
@@ -86,7 +92,13 @@ class SdFontData {
 
   // Font metadata (loaded once, kept in RAM)
   EpdFontHeader header;
-  EpdFontInterval* intervals;  // Dynamically allocated (~40KB for Korean)
+  // Intervals are NOT held in RAM. A CJK font's interval table is 50KB+ and a
+  // single contiguous allocation that fragments the heap — starving the XTC page
+  // buffer and blocking large-font loads. findGlyphIndex() binary-searches the
+  // table directly on the SD file instead. Only the most-recently matched
+  // interval is cached so runs of same-script text resolve with zero SD I/O.
+  mutable EpdFontInterval lastInterval{};
+  mutable bool lastIntervalValid = false;
   // Note: glyphs are NOT preloaded - loaded on-demand to save memory
 
   // Glyph metadata cache (per-font, small LRU cache)
@@ -95,6 +107,14 @@ class SdFontData {
   // Bitmap cache (shared across all SdFontData instances)
   static GlyphBitmapCache* sharedCache;
   static int cacheRefCount;
+
+  // Per-instance font identity, folded into the shared bitmap cache key so two
+  // distinct SD fonts loaded at once (reader + system font) never alias glyphs.
+  static uint32_t nextFontId;
+  uint32_t fontId;
+
+  // Build the shared-cache key for a codepoint within this font instance.
+  uint64_t bitmapCacheKey(uint32_t codepoint) const { return (static_cast<uint64_t>(fontId) << 32) | codepoint; }
 
   // File handle for reading (opened on demand).
   // Upstream HalStorage renamed FsFile -> HalFile; use HalFile directly so the
@@ -137,6 +157,10 @@ class SdFontData {
   // Get glyph by codepoint (loads bitmap on demand)
   const EpdGlyph* getGlyph(uint32_t codepoint) const;
 
+  // Returns true if this font actually contains codepoint (interval lookup only,
+  // no SD bitmap/metadata load — safe to call cheaply for glyph-fallback decisions).
+  bool hasGlyph(uint32_t codepoint) const { return loaded && findGlyphIndex(codepoint) >= 0; }
+
   // Get bitmap for a glyph (loads from SD if not cached)
   const uint8_t* getGlyphBitmap(uint32_t codepoint) const;
 
@@ -174,6 +198,8 @@ class SdFont {
   void getTextDimensions(const char* string, int* w, int* h) const;
   bool hasPrintableChars(const char* string) const;
   const EpdGlyph* getGlyph(uint32_t cp) const;
+  // Returns true only if the font actually contains a real glyph for cp.
+  bool hasGlyph(uint32_t cp) const { return data && data->hasGlyph(cp); }
   const uint8_t* getGlyphBitmap(uint32_t cp) const;
 
   // Metadata accessors
