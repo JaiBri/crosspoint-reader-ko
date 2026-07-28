@@ -37,9 +37,6 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuI
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
   }
   items.push_back({MenuAction::READER_OPTIONS, StrId::STR_READER_OPTIONS});
-  // Upstream's MenuAction::BOOKMARKS is deliberately NOT offered: it opens a
-  // second, disjoint bookmark store (JSON under /.crosspoint/bookmarks/) that
-  // never sees the entries in our Markdown sidecar. One store, one UI.
   items.push_back({MenuAction::ROTATE_SCREEN, StrId::STR_ORIENTATION});
   items.push_back({MenuAction::AUTO_PAGE_TURN, StrId::STR_AUTO_TURN_PAGES_PER_MIN});
   items.push_back({MenuAction::GO_TO_PERCENT, StrId::STR_GO_TO_PERCENT});

@@ -862,11 +862,6 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       // never dispatched here. Layout/orientation changes are reconciled
       // when the menu finally exits (see the menu's result handler in loop()).
       break;
-    case EpubReaderMenuActivity::MenuAction::BOOKMARKS:
-      // Not offered in the menu (see EpubReaderMenuActivity::buildMenuItems):
-      // upstream's bookmark list reads a separate JSON store that never sees the
-      // entries in our Markdown sidecar. VIEW_BOOKMARKS below is the one UI.
-      break;
   }
 }
 
@@ -1594,14 +1589,9 @@ void EpubReaderActivity::restoreSavedPosition() {
 void EpubReaderActivity::addBookmark() {
   // Quick, promptless bookmark bound to Confirm-hold.
   //
-  // Upstream's original implementation wrote a BookmarkEntry into a separate
-  // JSON store under /.crosspoint/bookmarks/. We keep a single store — the
-  // Markdown sidecar next to the book — so this now shares capturePendingBookmark()
-  // with the menu-driven path. A comment can be added later from the list.
-  //
-  // (The original also declared a local `std::vector<BookmarkEntry> bookmarks`
-  // that shadowed our member of the same name: it compiled cleanly and silently
-  // operated on the wrong container.)
+  // Writes to the Markdown sidecar via the same capture path as the menu entry,
+  // so there is exactly one bookmark store. A comment can be added later from
+  // the list.
   if (!capturePendingBookmark()) {
     return;
   }
